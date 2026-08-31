@@ -1,0 +1,111 @@
+{
+    "project_title": "Northstar Team Operations & E-Commerce Platform",
+    "features": [
+        {
+            "feature_name": "E-Commerce Order Processing & Discount Engine",
+            "target_module": "order_processing.py",
+            "business_rules": [
+                "Manages cart calculations, tiered customer discount rules, tax estimations, and checkout validation.",
+                "Customers belong to specific defined tiers determining discount applicability."
+            ],
+            "functions": [
+                {
+                    "signature": "calculate_cart_total(cart_id: str, customer_tier: str) -> float",
+                    "purpose": "Computes total cart price incorporating customer tier discounts and tax estimations."
+                },
+                {
+                    "signature": "validate_checkout(cart_id: str) -> bool",
+                    "purpose": "Validates cart items, pricing rules, and checkout parameters prior to order confirmation."
+                }
+            ],
+            "exceptions": [
+                "InvalidCartException",
+                "DiscountApplicationException"
+            ]
+        },
+        {
+            "feature_name": "Notifications System",
+            "target_module": "notifications.py",
+            "business_rules": [
+                "Generate notifications when a user is assigned a work item or mentioned in a comment.",
+                "Internal bookkeeping database changes must not generate user notifications.",
+                "Email delivery failures must not roll back underlying work item assignments or mentions.",
+                "Avoid duplicate notifications when retrying operations.",
+                "Notification list must distinguish unread items from read items without deleting read notifications."
+            ],
+            "functions": [
+                {
+                    "signature": "create_notification(user_id: str, event_type: str, payload: dict) -> str",
+                    "purpose": "Generates an in-app notification for relevant work item updates or user mentions."
+                },
+                {
+                    "signature": "mark_as_read(notification_id: str, user_id: str) -> None",
+                    "purpose": "Updates notification status to read without deleting it from the notification history."
+                }
+            ],
+            "exceptions": [
+                "NotificationDeliveryFailedException",
+                "DuplicateNotificationException"
+            ]
+        },
+        {
+            "feature_name": "Attachment Access Control",
+            "target_module": "attachment_service.py",
+            "business_rules": [
+                "Attachments must strictly adhere to the access control rules of their associated work item.",
+                "Knowledge of a storage identifier alone must not grant download or view access.",
+                "File downloads must be authorized independently from the work item page view.",
+                "Unsupported preview file formats must be provided as standard downloadable content."
+            ],
+            "functions": [
+                {
+                    "signature": "authorize_file_download(attachment_id: str, user_id: str) -> str",
+                    "purpose": "Verifies user access permissions for the target work item and yields a secure download token."
+                }
+            ],
+            "exceptions": [
+                "UnauthorizedAttachmentAccessException",
+                "FileNotFoundException"
+            ]
+        },
+        {
+            "feature_name": "Dashboard & Activity Summarization",
+            "target_module": "dashboard.py",
+            "business_rules": [
+                "Dashboard must summarize active projects and assigned work items for the current user.",
+                "Completed and archived work must not dominate the default dashboard view.",
+                "A user with no assigned work must be presented with a helpful empty state rather than an error.",
+                "Dashboard counts must be derived dynamically from accessible current data.",
+                "Timestamps and date-oriented information must consider the organization timezone."
+            ],
+            "functions": [
+                {
+                    "signature": "get_user_dashboard_summary(user_id: str, organization_id: str) -> dict",
+                    "purpose": "Fetches aggregated count of active work items and user attention points."
+                }
+            ],
+            "exceptions": [
+                "OrganizationNotFoundException",
+                "DashboardDataFetchException"
+            ]
+        },
+        {
+            "feature_name": "Activity History Tracking",
+            "target_module": "activity_service.py",
+            "business_rules": [
+                "Records significant actions including project creation, ownership changes, assignment updates, and status changes.",
+                "Activities must include actor references whenever identifiable human interactions occur.",
+                "Internal operational events such as cache refreshes or search re-indexing must not be recorded as activity."
+            ],
+            "functions": [
+                {
+                    "signature": "log_activity(event_type: str, actor_id: str, target_id: str, metadata: dict) -> None",
+                    "purpose": "Appends a new immutable activity log entry with consistent timestamping."
+                }
+            ],
+            "exceptions": [
+                "InvalidActivityPayloadException"
+            ]
+        }
+    ]
+}

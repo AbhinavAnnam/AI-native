@@ -1,29 +1,37 @@
 import os
 from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-def extract_text_from_file(file_path: str) -> str:
-    """Reads PDF, TXT, or MD files and returns raw text."""
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".pdf":
-        reader = PdfReader(file_path)
-        pages = [
-            f"--- Page {i+1} ---\n{page.extract_text()}"
-            for i, page in enumerate(reader.pages)
-            if page.extract_text()
-        ]
-        return "\n".join(pages)
-    elif ext in [".txt", ".md"]:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return f.read()
-    else:
-        raise ValueError(f"Unsupported extension: {ext}")
+def parse_documents(docs_dir: str = "./docs") -> list[dict]:
+    """Parses all documents in a folder into page-level chunks with metadata."""
+    chunks = []
+    if not os.path.exists(docs_dir):
+        return chunks
 
-def chunk_document_text(text: str, chunk_size: int = 500, chunk_overlap: int = 80) -> list[str]:
-    """Splits text into small overlapping chunks to keep context sharp."""
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n## ", "\n# ", "\n\n", "\n", " ", ""]
-    )
-    return splitter.split_text(text)
+    for file in os.listdir(docs_dir):
+        file_path = os.path.join(docs_dir, file)
+        if not os.path.isfile(file_path):
+            continue
+
+        # Page-by-page PDF extraction
+        if file.endswith(".pdf"):
+            reader = PdfReader(file_path)
+            for page_num, page in enumerate(reader.pages, start=1):
+                text = page.extract_text()
+                if text and text.strip():
+                    chunks.append({
+                        "text": text.strip(),
+                        "metadata": {"source": file, "page": page_num}
+                    })
+
+        # Section-by-section TXT / MD extraction
+        elif file.endswith((".txt", ".md")):
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+            sections = [s.strip() for s in text.split("\n\n") if s.strip()]
+            for idx, sec in enumerate(sections, start=1):
+                chunks.append({
+                    "text": sec,
+                    "metadata": {"source": file, "section": idx}
+                })
+
+    return chunks
