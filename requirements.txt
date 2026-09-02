@@ -1,6 +1,15 @@
-pypdf
-langchain-text-splitters
-chromadb
-sentence-transformers
+# Core RAG & LLM
 google-genai
+chromadb
+pydantic
 python-dotenv
+sentence-transformers
+pypdf
+
+# Backend Service
+fastapi
+uvicorn
+
+# Frontend UI & API Client
+streamlit
+requests

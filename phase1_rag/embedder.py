@@ -1,34 +1,55 @@
-import os
+import logging
 import chromadb
-from chromadb.utils import embedding_functions
+from sentence_transformers import SentenceTransformer
 
 class DocumentEmbedder:
-    def __init__(self, db_dir: str = "./chroma_db_docs"):
-        self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="BAAI/bge-small-en-v1.5"
+    def __init__(self, db_dir: str = "chroma_db_docs", collection_name: str = "active_rag_context"):
+        self.db_dir = db_dir
+        self.collection_name = collection_name
+        self.chroma_client = chromadb.PersistentClient(path=self.db_dir)
+        self.embedding_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+        
+    def ingest_chunks(self, chunks: list[dict]):
+        """Wipes the active user collection and ingests fresh chunks."""
+        try:
+            self.chroma_client.delete_collection(name=self.collection_name)
+            logging.info(f"Cleared existing '{self.collection_name}' collection for fresh document upload.")
+        except Exception:
+            logging.info(f"Initialized new '{self.collection_name}' collection.")
+
+        collection = self.chroma_client.create_collection(name=self.collection_name)
+
+        texts = [c["text"] for c in chunks]
+        metadatas = [{"source": c.get("source", "doc"), "page": c.get("page", 1)} for c in chunks]
+        ids = [f"doc_chunk_{i}" for i in range(len(chunks))]
+
+        embeddings = self.embedding_model.encode(texts, show_progress_bar=False).tolist()
+
+        collection.add(
+            documents=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids
         )
-        self.client = chromadb.PersistentClient(path=db_dir)
-        self.collection = self.client.get_or_create_collection(
-            name="requirements_specs",
-            embedding_function=self.embedding_fn
+        logging.info(f"Successfully indexed {len(chunks)} chunks into '{self.collection_name}'.")
+
+    def retrieve_relevant_chunks(self, query: str, top_k: int = 20) -> list[dict]:
+        collection = self.chroma_client.get_collection(name=self.collection_name)
+        query_embedding = self.embedding_model.encode([query]).tolist()
+
+        results = collection.query(
+            query_embeddings=query_embedding,
+            n_results=top_k
         )
 
-    def ingest_chunks(self, chunks: list[dict]) -> str:
-        """Stores text chunks alongside page/file metadata."""
-        if not chunks:
-            return "No valid documents found in docs folder."
-
-        documents = [c["text"] for c in chunks]
-        metadatas = [c["metadata"] for c in chunks]
-        ids = [f"{c['metadata']['source']}_c{idx}" for idx, c in enumerate(chunks)]
-
-        self.collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
-        return f"Indexed {len(chunks)} page/section chunk(s) into ChromaDB."
-
-    def retrieve_relevant_chunks(self, query: str, top_k: int = 5) -> list[dict]:
-        """Queries database for top matching semantic chunks."""
-        results = self.collection.query(query_texts=[query], n_results=top_k)
-        docs = results.get("documents", [[]])[0]
-        metas = results.get("metadatas", [[]])[0]
-        return [{"text": doc, "source": meta.get("source"), "page": meta.get("page", 1)} 
-                for doc, meta in zip(docs, metas)]
+        retrieved_chunks = []
+        if results and results["documents"]:
+            docs = results["documents"][0]
+            metas = results["metadatas"][0]
+            for doc, meta in zip(docs, metas):
+                retrieved_chunks.append({
+                    "text": doc,
+                    "source": meta.get("source", "Unknown"),
+                    "page": meta.get("page", 1)
+                })
+        return retrieved_chunks

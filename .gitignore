@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 .env
 workspace/
+# Local RAG storage and dynamic file uploads
+temp_uploads/
+chroma_db_docs/
+pipeline.log
+extracted_specs.json

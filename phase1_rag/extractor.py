@@ -1,4 +1,5 @@
 import os
+import logging
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -10,15 +11,15 @@ load_dotenv()
 
 # --- Feature-Driven Schema Definition ---
 class FunctionSpec(BaseModel):
-    signature: str
-    purpose: str
+    signature: str = Field(description="Python-style function signature with parameter types")
+    purpose: str = Field(description="Brief explanation of what the function accomplishes")
 
 class FeatureRequirement(BaseModel):
-    feature_name: str
-    target_module: str = Field(description="e.g., discount_service.py or auth.py")
-    business_rules: list[str]
-    functions: list[FunctionSpec]
-    exceptions: list[str]
+    feature_name: str = Field(description="Name of the functional domain or feature module")
+    target_module: str = Field(description="Suggested snake_case target python filename, e.g., projects.py or work_items.py")
+    business_rules: list[str] = Field(description="Key operational and validation rules governing this feature")
+    functions: list[FunctionSpec] = Field(description="Required function signatures belonging to this module")
+    exceptions: list[str] = Field(description="List of custom exception names explicitly related to this module")
 
 class ExtractedSpecs(BaseModel):
     project_title: str
@@ -33,10 +34,15 @@ class RequirementExtractor:
             raise ValueError("GEMINI_API_KEY not found. Ensure it is set in your .env file.")
         self.client = genai.Client(api_key=key)
 
-    def synthesize_requirements(self, task_description: str) -> str:
-        chunks = self.embedder.retrieve_relevant_chunks(task_description, top_k=5)
+    def synthesize_requirements(self, task_description: str, top_k: int = 20) -> str:
+        logging.info(f"Retrieving top {top_k} relevant chunks from vector store...")
+        chunks = self.embedder.retrieve_relevant_chunks(task_description, top_k=top_k)
+        
         if not chunks:
+            logging.warning("No context chunks were retrieved for the query.")
             return "No matching document context found."
+
+        logging.info(f"Successfully retrieved {len(chunks)} chunks. Formatting context for Gemini...")
 
         # Format context with document source and exact page numbers
         raw_context = "\n\n".join([
@@ -45,17 +51,21 @@ class RequirementExtractor:
         ])
 
         prompt = f"""
-        You are a Technical Specification Synthesizer. Analyze the retrieved documentation across all pages and extract exact context grouped by distinct FEATURE modules.
+        You are a Principal Software Architect. Analyze the provided operational documentation across all retrieved pages.
+        Extract complete operational specifications and map them cleanly into distinct feature modules based strictly on the text.
 
         RETRIEVED DOCUMENTATION:
         {raw_context}
 
-        TARGET FEATURE TASK:
+        TARGET SCOPE TASK:
         {task_description}
 
-        Group all function signatures, business rules, exceptions, and input constraints under their target feature module.
+        Extract all distinct feature domains (e.g., Accounts & Identity, Organizations, Projects, Work Items, Comments, Attachments, Notifications, Search, Dashboard, Activity History).
+        For each domain, define business rules, function signatures, and explicit custom exceptions. Do not fabricate features outside the document.
         """
 
+        logging.info("Sending request to Gemini 3.6 Flash for structured specification extraction...")
+        
         # Uses google-genai SDK config for structured output matching ExtractedSpecs
         response = self.client.models.generate_content(
             model="gemini-3.6-flash",
@@ -65,4 +75,6 @@ class RequirementExtractor:
                 response_schema=ExtractedSpecs
             )
         )
+        
+        logging.info("Gemini specification synthesis completed successfully.")
         return response.text
