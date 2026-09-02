@@ -1,111 +1,263 @@
 {
-    "project_title": "Northstar Team Operations & E-Commerce Platform",
-    "features": [
+  "project_title": "Northstar Team Operations Platform",
+  "features": [
+    {
+      "feature_name": "Accounts & Identity",
+      "target_module": "accounts.py",
+      "business_rules": [
+        "Accounts are identified by email address, evaluated case-insensitively for lookup while preserving original capitalization for display.",
+        "A user must verify email address ownership before their account is treated as fully active.",
+        "Password reset mechanisms must use temporary links, invalidate previous links upon reset, and prevent user-enumeration by not revealing whether an email exists.",
+        "Password changes must invalidate all existing active user sessions.",
+        "Account deactivation must maintain historical references and audit entries without granting new access."
+      ],
+      "functions": [
         {
-            "feature_name": "E-Commerce Order Processing & Discount Engine",
-            "target_module": "order_processing.py",
-            "business_rules": [
-                "Manages cart calculations, tiered customer discount rules, tax estimations, and checkout validation.",
-                "Customers belong to specific defined tiers determining discount applicability."
-            ],
-            "functions": [
-                {
-                    "signature": "calculate_cart_total(cart_id: str, customer_tier: str) -> float",
-                    "purpose": "Computes total cart price incorporating customer tier discounts and tax estimations."
-                },
-                {
-                    "signature": "validate_checkout(cart_id: str) -> bool",
-                    "purpose": "Validates cart items, pricing rules, and checkout parameters prior to order confirmation."
-                }
-            ],
-            "exceptions": [
-                "InvalidCartException",
-                "DiscountApplicationException"
-            ]
+          "signature": "register_account(email: str, password: str) -> dict",
+          "purpose": "Registers a new user account and initiates email verification."
         },
         {
-            "feature_name": "Notifications System",
-            "target_module": "notifications.py",
-            "business_rules": [
-                "Generate notifications when a user is assigned a work item or mentioned in a comment.",
-                "Internal bookkeeping database changes must not generate user notifications.",
-                "Email delivery failures must not roll back underlying work item assignments or mentions.",
-                "Avoid duplicate notifications when retrying operations.",
-                "Notification list must distinguish unread items from read items without deleting read notifications."
-            ],
-            "functions": [
-                {
-                    "signature": "create_notification(user_id: str, event_type: str, payload: dict) -> str",
-                    "purpose": "Generates an in-app notification for relevant work item updates or user mentions."
-                },
-                {
-                    "signature": "mark_as_read(notification_id: str, user_id: str) -> None",
-                    "purpose": "Updates notification status to read without deleting it from the notification history."
-                }
-            ],
-            "exceptions": [
-                "NotificationDeliveryFailedException",
-                "DuplicateNotificationException"
-            ]
+          "signature": "verify_email(verification_token: str) -> bool",
+          "purpose": "Verifies account email ownership using a temporary verification token."
         },
         {
-            "feature_name": "Attachment Access Control",
-            "target_module": "attachment_service.py",
-            "business_rules": [
-                "Attachments must strictly adhere to the access control rules of their associated work item.",
-                "Knowledge of a storage identifier alone must not grant download or view access.",
-                "File downloads must be authorized independently from the work item page view.",
-                "Unsupported preview file formats must be provided as standard downloadable content."
-            ],
-            "functions": [
-                {
-                    "signature": "authorize_file_download(attachment_id: str, user_id: str) -> str",
-                    "purpose": "Verifies user access permissions for the target work item and yields a secure download token."
-                }
-            ],
-            "exceptions": [
-                "UnauthorizedAttachmentAccessException",
-                "FileNotFoundException"
-            ]
+          "signature": "request_password_reset(email: str) -> None",
+          "purpose": "Initiates a password reset workflow without exposing account existence."
         },
         {
-            "feature_name": "Dashboard & Activity Summarization",
-            "target_module": "dashboard.py",
-            "business_rules": [
-                "Dashboard must summarize active projects and assigned work items for the current user.",
-                "Completed and archived work must not dominate the default dashboard view.",
-                "A user with no assigned work must be presented with a helpful empty state rather than an error.",
-                "Dashboard counts must be derived dynamically from accessible current data.",
-                "Timestamps and date-oriented information must consider the organization timezone."
-            ],
-            "functions": [
-                {
-                    "signature": "get_user_dashboard_summary(user_id: str, organization_id: str) -> dict",
-                    "purpose": "Fetches aggregated count of active work items and user attention points."
-                }
-            ],
-            "exceptions": [
-                "OrganizationNotFoundException",
-                "DashboardDataFetchException"
-            ]
+          "signature": "reset_password(reset_token: str, new_password: str) -> bool",
+          "purpose": "Resets the user password using a valid temporary token and revokes active sessions."
         },
         {
-            "feature_name": "Activity History Tracking",
-            "target_module": "activity_service.py",
-            "business_rules": [
-                "Records significant actions including project creation, ownership changes, assignment updates, and status changes.",
-                "Activities must include actor references whenever identifiable human interactions occur.",
-                "Internal operational events such as cache refreshes or search re-indexing must not be recorded as activity."
-            ],
-            "functions": [
-                {
-                    "signature": "log_activity(event_type: str, actor_id: str, target_id: str, metadata: dict) -> None",
-                    "purpose": "Appends a new immutable activity log entry with consistent timestamping."
-                }
-            ],
-            "exceptions": [
-                "InvalidActivityPayloadException"
-            ]
+          "signature": "deactivate_account(user_id: str) -> bool",
+          "purpose": "Deactivates a user account while retaining historical references across organizations."
         }
-    ]
+      ],
+      "exceptions": [
+        "AccountNotVerifiedError",
+        "InvalidTokenError",
+        "AccountDeactivatedError"
+      ]
+    },
+    {
+      "feature_name": "Organizations & Membership",
+      "target_module": "organizations.py",
+      "business_rules": [
+        "Organizations act as strict multi-tenant boundaries; access to one organization grants no access to another.",
+        "Initial creator becomes the organization owner; ownership can be explicitly transferred to another active member.",
+        "Invitations are sent via email using temporary tokens; accepting an invitation links existing accounts without creating duplicate identities.",
+        "Member removal immediately revokes access but leaves historical activities, comments, and item assignments intact.",
+        "Updating organization timezone adjusts calendar presentations without modifying historical UTC timestamps."
+      ],
+      "functions": [
+        {
+          "signature": "create_organization(name: str, owner_id: str, timezone: str = 'UTC') -> dict",
+          "purpose": "Creates a new organization tenant and sets the initial owner."
+        },
+        {
+          "signature": "invite_member(org_id: str, email: str, inviter_id: str) -> dict",
+          "purpose": "Sends an organization invitation token to a target email address."
+        },
+        {
+          "signature": "accept_invitation(invitation_token: str, user_id: str) -> bool",
+          "purpose": "Processes invitation acceptance and adds user to organization membership."
+        },
+        {
+          "signature": "revoke_invitation(org_id: str, invitation_id: str, admin_id: str) -> bool",
+          "purpose": "Revokes an outstanding pending organization invitation."
+        },
+        {
+          "signature": "transfer_ownership(org_id: str, current_owner_id: str, new_owner_id: str) -> bool",
+          "purpose": "Transfers tenant ownership to another active organization member."
+        },
+        {
+          "signature": "remove_member(org_id: str, member_id: str, admin_id: str) -> bool",
+          "purpose": "Removes a member from the organization while preserving historical activity."
+        }
+      ],
+      "exceptions": [
+        "OrganizationAccessDeniedError",
+        "InvitationExpiredError",
+        "OwnershipTransferError",
+        "CannotRemoveOwnerError"
+      ]
+    },
+    {
+      "feature_name": "Projects & Project Membership",
+      "target_module": "projects.py",
+      "business_rules": [
+        "Project names are scoped to organizations and do not require global uniqueness.",
+        "Project access is separate from organization membership; non-members cannot join projects.",
+        "Archiving removes projects from active working views while preserving read access for authorized users; completion indicates reached goals.",
+        "Project deletion is a destructive operation that must handle dependent work items, comments, attachments, and activity history without leaving orphaned data.",
+        "Removing a project member revokes project access but preserves assigned work items and recorded activities."
+      ],
+      "functions": [
+        {
+          "signature": "create_project(org_id: str, name: str, creator_id: str, description: str = None, due_date: str = None) -> dict",
+          "purpose": "Creates a new project within an organization and assigns initial ownership."
+        },
+        {
+          "signature": "archive_project(project_id: str, user_id: str) -> bool",
+          "purpose": "Archives a project to remove it from primary active workspace views."
+        },
+        {
+          "signature": "add_project_member(project_id: str, member_id: str, actor_id: str) -> bool",
+          "purpose": "Adds an organization member to a specific project."
+        },
+        {
+          "signature": "remove_project_member(project_id: str, member_id: str, actor_id: str) -> bool",
+          "purpose": "Removes a member from a project without deleting historical contributions."
+        },
+        {
+          "signature": "delete_project(project_id: str, actor_id: str) -> bool",
+          "purpose": "Permanently deletes a project and safely cleans up dependent entities."
+        }
+      ],
+      "exceptions": [
+        "ProjectNotFoundError",
+        "ProjectAccessDeniedError",
+        "InvalidProjectStateError"
+      ]
+    },
+    {
+      "feature_name": "Work Items",
+      "target_module": "work_items.py",
+      "business_rules": [
+        "A work item belongs to one project and requires at minimum a title and a status.",
+        "Initial status states include uncompleted, in-progress, and completed; completed items can be reopened.",
+        "Priority uses a small ordered semantic range rather than arbitrary numbers.",
+        "Unassigned work items are valid; assignees must be valid project members.",
+        "Due dates represent calendar days independent of viewer timezone and can be removed after being set."
+      ],
+      "functions": [
+        {
+          "signature": "create_work_item(project_id: str, title: str, creator_id: str, priority: int, assignee_id: str = None, due_date: str = None) -> dict",
+          "purpose": "Creates a new work item inside a designated project."
+        },
+        {
+          "signature": "update_work_item_status(work_item_id: str, status: str, user_id: str) -> dict",
+          "purpose": "Updates work item state and records historical movement."
+        },
+        {
+          "signature": "assign_work_item(work_item_id: str, assignee_id: str, user_id: str) -> dict",
+          "purpose": "Assigns or reassigns a work item to an authorized project participant."
+        },
+        {
+          "signature": "update_work_item_details(work_item_id: str, title: str = None, description: str = None, priority: int = None, due_date: str = None) -> dict",
+          "purpose": "Modifies editable work item fields."
+        },
+        {
+          "signature": "reorder_work_items(project_id: str, ordered_item_ids: list) -> bool",
+          "purpose": "Reorders work items within a project view based on user display preferences."
+        }
+      ],
+      "exceptions": [
+        "WorkItemNotFoundError",
+        "InvalidStatusTransitionError",
+        "InvalidAssigneeError"
+      ]
+    },
+    {
+      "feature_name": "Comments & Attachments",
+      "target_module": "comments_and_attachments.py",
+      "business_rules": [
+        "Comments attach directly to work items without threaded replies; bodies are unverified user input requiring safe rendering.",
+        "Deleting a comment visually marks content as removed while preserving audit logs.",
+        "Attachments inherit work item access controls; knowing an identifier is insufficient to bypass authorization.",
+        "Uploaded filenames must be sanitized against path traversal attacks (e.g. ../../) and checked against upload size limits.",
+        "File downloads require authorization checks prior to serving content or generating limited-lifetime URLs."
+      ],
+      "functions": [
+        {
+          "signature": "add_comment(work_item_id: str, author_id: str, body: str) -> dict",
+          "purpose": "Posts a sanitized comment on a work item."
+        },
+        {
+          "signature": "edit_comment(comment_id: str, author_id: str, new_body: str) -> dict",
+          "purpose": "Edits comment text while keeping original author and timestamp metadata."
+        },
+        {
+          "signature": "delete_comment(comment_id: str, user_id: str) -> bool",
+          "purpose": "Soft-deletes a comment while leaving an activity record indicator."
+        },
+        {
+          "signature": "upload_attachment(work_item_id: str, file_name: str, file_data: bytes, uploader_id: str, comment_id: str = None) -> dict",
+          "purpose": "Validates, sanitizes, and uploads an attachment file."
+        },
+        {
+          "signature": "generate_download_url(attachment_id: str, user_id: str) -> str",
+          "purpose": "Verifies parent resource permissions and returns a temporary download URL."
+        }
+      ],
+      "exceptions": [
+        "CommentNotFoundError",
+        "AttachmentNotFoundError",
+        "UnsafeFileError",
+        "FileSizeLimitExceededError"
+      ]
+    },
+    {
+      "feature_name": "Search & Dashboard",
+      "target_module": "search_and_dashboard.py",
+      "business_rules": [
+        "Search enforces exact tenant and project access boundaries, prioritizing useful partial matches over exact title matching.",
+        "Search indexing processes project names, project descriptions, work item titles, work item descriptions, and comments asynchronously.",
+        "Dashboard displays active projects and work assigned to current user, excluding dominating completed or archived work.",
+        "Dashboard metrics are dynamically derived from current accessible data rather than stored as separate source of truth.",
+        "Users with no assigned work receive a clear empty state without error codes."
+      ],
+      "functions": [
+        {
+          "signature": "search_operational_content(org_id: str, user_id: str, query: str, page: int = 1) -> dict",
+          "purpose": "Executes permission-aware search across operational workspace entities."
+        },
+        {
+          "signature": "get_user_dashboard(org_id: str, user_id: str) -> dict",
+          "purpose": "Generates dashboard summary of active assigned work and recent modifications."
+        },
+        {
+          "signature": "reindex_resource(resource_type: str, resource_id: str) -> bool",
+          "purpose": "Asynchronously updates search index records following resource changes."
+        }
+      ],
+      "exceptions": [
+        "SearchIndexUnavailableError",
+        "InvalidQueryError"
+      ]
+    },
+    {
+      "feature_name": "Notifications & Activity History",
+      "target_module": "notifications_and_activity.py",
+      "business_rules": [
+        "Notifications are triggered for relevant events such as item assignment or comment mentions.",
+        "Notifications can be marked read without deletion, distinguishing read from unread entries.",
+        "Delivery failures in external channels (such as email) must not rollback primary database operations.",
+        "Activity history is append-only, recording actors, timestamps, and key state transitions.",
+        "Historical logs preserve actor contextual identity even if account display names are updated or deactivated."
+      ],
+      "functions": [
+        {
+          "signature": "create_activity_record(org_id: str, event_type: str, actor_id: str, target_id: str, details: dict) -> dict",
+          "purpose": "Appends a new event entry to the organization activity log."
+        },
+        {
+          "signature": "get_activity_feed(org_id: str, user_id: str, project_id: str = None, page: int = 1) -> dict",
+          "purpose": "Fetches a paginated, authorized activity feed."
+        },
+        {
+          "signature": "send_notification(user_id: str, event_type: str, payload: dict) -> bool",
+          "purpose": "Generates an in-app notification and dispatches optional background email."
+        },
+        {
+          "signature": "mark_notification_as_read(notification_id: str, user_id: str) -> bool",
+          "purpose": "Updates notification status to read."
+        }
+      ],
+      "exceptions": [
+        "NotificationNotFoundError",
+        "ActivityLoggingError"
+      ]
+    }
+  ]
 }
