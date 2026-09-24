@@ -1,152 +1,94 @@
+import concurrent.futures
 import io
 import json
 import logging
+import os
+import re
+import threading
 import time
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type, Union
 
 import pypdf
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# Track exhausted models for the execution session to prevent repeated rate-limit loops
 EXHAUSTED_MODELS = set()
+EXHAUSTED_LOCK = threading.Lock()
 
 
-# =====================================================================
-# 1. PYDANTIC SCHEMAS FOR CODER AGENT FIDELITY
-# =====================================================================
-
-class FunctionSpec(BaseModel):
-    signature: str = Field(description="Normalized pythonic function signature with typed parameters and return type.")
-    purpose: str = Field(description="Exact operational purpose of the function.")
+def reset_exhausted_models():
+    """Resets the global blacklisted models set prior to starting an extraction pipeline."""
+    global EXHAUSTED_MODELS, EXHAUSTED_LOCK
+    with EXHAUSTED_LOCK:
+        EXHAUSTED_MODELS.clear()
 
 
-class FeatureModule(BaseModel):
-    feature_name: str = Field(description="Human-readable module name.")
-    target_module: str = Field(description="Snake_case module identifier.")
-    business_rules: List[str] = Field(description="Functional domain rules, state transition rules, and validation requirements.")
-    functions: List[FunctionSpec] = Field(description="Explicit API or internal function signatures needed for this module.")
-    exceptions: List[str] = Field(description="Error handling, validation failures, and edge cases specific to this module.")
+def clean_json_text(text: str) -> str:
+    """
+    Cleans raw text before JSON parsing:
+    1. Strips markdown code fences (e.g. ```json ... ```).
+    2. Strips malformed array numeric key prefixes (e.g., '[ 0: {' or ', 1: {').
+    """
+    text = text.strip()
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if match:
+        text = match.group(1).strip()
+
+    # Pre-parse syntax repair for pseudo-array key prefixes like '[ 0: {' or ', 1: {'
+    text = re.sub(r'(\[\s*)\d+\s*:\s*', r'\1', text)
+    text = re.sub(r',\s*\d+\s*:\s*', ', ', text)
+
+    return text.strip()
 
 
-class CrossCuttingRules(BaseModel):
-    concurrency_and_race_conditions: List[str] = Field(description="Rules covering concurrent edits, idempotency, race condition prevention, and double-submit guards.")
-    temporal_and_timezone_mechanics: List[str] = Field(description="Rules for UTC storage, display timezones, DST handling, calendar vs instant semantics, and relative dates.")
-    background_processing_and_retries: List[str] = Field(description="Asynchronous job requirements, retry strategies, idempotency keys, and side-effect isolation.")
-    security_and_tenant_isolation: List[str] = Field(description="Multi-tenancy isolation rules, authorization, file storage security, path traversal prevention, and token safety.")
-    data_retention_and_historical_integrity: List[str] = Field(description="Soft deletion, deactivation semantics, append-only logs, and historical display name preservation.")
+def normalize_dict_lists(data: Any) -> Any:
+    """
+    Recursively transforms dictionary objects with numeric string keys ('0', '1', ...)
+    into clean JSON/Python lists.
+    """
+    if isinstance(data, dict):
+        keys = list(data.keys())
+        if keys and all(k.isdigit() for k in keys):
+            sorted_keys = sorted(keys, key=lambda k: int(k))
+            return [normalize_dict_lists(data[k]) for k in sorted_keys]
+        return {k: normalize_dict_lists(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [normalize_dict_lists(item) for item in data]
+    return data
 
 
-class SystemSpecification(BaseModel):
-    project_title: str = Field(description="Name of the project or workspace.")
-    features: List[FeatureModule] = Field(description="Bounded domain modules containing core workflows and logic.")
-    cross_cutting_constraints: CrossCuttingRules = Field(description="System-wide non-functional requirements essential for implementation correctness.")
-
-
-# =====================================================================
-# 2. MAP & REDUCE PROMPTS (ENFORCING ZERO-DROP)
-# =====================================================================
-
-MAP_SYSTEM_PROMPT = """
-You are an expert Systems Architect. Analyze this contiguous section of project documentation and extract EVERY single detail, rule, requirement, edge case, and architectural constraint.
-
-EXTRACT EVERYTHING IN THE FOLLOWING BUCKETS:
-1. FUNCTIONAL LOGIC: Function ideas, arguments, state transitions, validation rules, business logic.
-2. CONCURRENCY & RACES: Idempotency, simultaneous edits, duplicate request handling, retry protection.
-3. TEMPORAL/TIMEZONE RULES: UTC conversion, calendar vs instant semantics, relative dates, DST logic.
-4. BACKGROUND & RETRIES: Asynchronous processing, failed mail/indexing isolation, background job safety.
-5. SECURITY & TENANT ISOLATION: Cross-tenant leakage guards, token semantics, file download authorization, path traversal rules.
-6. DATA INTEGRITY: Account deactivation history preservation, soft deletes, activity audit trails.
-
-Do NOT summarize. Extract raw exact logic regardless of formatting or prose style.
-"""
-
-REDUCE_SYSTEM_PROMPT = """
-You are a Principal Software Architect building a specification for an automated Coder Agent.
-You are given raw extractions from an entire documentation set.
-
-CONSOLIDATION & ZERO-DROP RULES:
-1. Preserve Every Invariant: Your output MUST capture every business rule, edge case, concurrency guarantee, background retry behavior, and timezone rule mentioned.
-2. Map to Dual Hierarchy:
-   - Functional capabilities go into `features` (bounded domain modules).
-   - Non-functional, cross-cutting rules (concurrency, background retries, DST, tenant isolation, historical data preservation) MUST go into `cross_cutting_constraints`.
-3. Standardize Signatures: All functions inside `features` must have snake_case identifiers, typed arguments, and explicit return signatures.
-4. Zero Invention: Do not invent rules not mentioned, but strictly preserve 100% of stated logic.
-"""
-
-
-# =====================================================================
-# 3. UTILITIES & RETRY LOGIC WITH CIRCUIT BREAKER
-# =====================================================================
-
-def _extract_text_from_uploads(files: List[Any]) -> str:
-    combined_text = []
-    for file in files:
-        filename = getattr(file, "filename", "uploaded_doc")
-        logger.info(f"Parsing uploaded file: {filename}")
-        file_bytes = file.file.read()
-
-        if filename.lower().endswith(".pdf"):
-            pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-            for page_idx, page in enumerate(pdf_reader.pages):
-                text = page.extract_text()
-                if text:
-                    combined_text.append(
-                        f"--- Document: {filename} (Page {page_idx + 1}) ---\n{text}"
-                    )
-        else:
-            text_content = file_bytes.decode("utf-8", errors="ignore")
-            combined_text.append(f"--- Document: {filename} ---\n{text_content}")
-
-    return "\n\n".join(combined_text)
-
-
-def _chunk_text_contiguous(
-    text: str, chunk_size: int = 12000, overlap: int = 1500
-) -> List[str]:
-    chunks = []
-    start = 0
-    text_len = len(text)
-
-    while start < text_len:
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start += chunk_size - overlap
-
-    return chunks
-
-
-def _call_gemini_with_fallback(
+def call_gemini_with_fallback(
     client: genai.Client,
     models_in_priority: List[str],
     contents: str,
     config: types.GenerateContentConfig,
     max_retries_per_model: int = 2,
 ) -> Any:
-    """Tries primary model first. If quota/server overload is hit, permanently flags the model 
-    as exhausted for the run and moves to the next candidate model."""
-    global EXHAUSTED_MODELS
+    """Executes a Gemini API call with thread-safe global model blacklisting."""
+    global EXHAUSTED_MODELS, EXHAUSTED_LOCK
 
-    # Filter out models that already hit hard rate limits/quota/server errors in previous calls
-    active_models = [m for m in models_in_priority if m not in EXHAUSTED_MODELS]
+    for model in models_in_priority:
+        with EXHAUSTED_LOCK:
+            if model in EXHAUSTED_MODELS:
+                continue
 
-    if not active_models:
-        raise RuntimeError(
-            f"All candidate models are exhausted for this session: {models_in_priority}"
-        )
-
-    for model in active_models:
-        delay = 2.0
+        delay = 1.0
         for attempt in range(1, max_retries_per_model + 1):
+            with EXHAUSTED_LOCK:
+                if model in EXHAUSTED_MODELS:
+                    logger.info(
+                        f"Skipping {model} (Attempt {attempt}) - blacklisted by parallel worker."
+                    )
+                    break
+
             try:
-                logger.info(
-                    f"Attempting API call with model: {model} (Attempt {attempt})..."
-                )
+                logger.info(f"API Request -> Model: {model} (Attempt {attempt})")
                 return client.models.generate_content(
                     model=model,
                     contents=contents,
@@ -156,14 +98,17 @@ def _call_gemini_with_fallback(
                 err_msg = str(e)
                 err_code = getattr(e, "code", None)
 
-                # Catch rate limits (429), server overload (503), temporary outages (500, 502, 504), and status string keywords
-                is_transient_or_rate_limit = (
-                    err_code in [429, 500, 502, 503, 504]
-                    or any(code in err_msg for code in ["429", "503", "500", "502", "504"])
+                is_quota_exceeded = (
+                    "429" in err_msg
+                    or "RESOURCE_EXHAUSTED" in err_msg
+                    or err_code == 429
+                )
+                is_transient = (
+                    err_code in [500, 502, 503, 504]
+                    or any(code in err_msg for code in ["503", "500", "502", "504"])
                     or any(
                         term in err_msg
                         for term in [
-                            "RESOURCE_EXHAUSTED",
                             "UNAVAILABLE",
                             "high demand",
                             "TEMPORARY",
@@ -172,35 +117,130 @@ def _call_gemini_with_fallback(
                     )
                 )
 
-                if is_transient_or_rate_limit:
+                if is_quota_exceeded:
                     logger.warning(
-                        f"Model {model} hit transient error/rate-limit (Attempt {attempt}/{max_retries_per_model}): {err_msg}"
+                        f"Model {model} hit 429 Rate/Quota limit. Blacklisting globally across all threads."
+                    )
+                    with EXHAUSTED_LOCK:
+                        EXHAUSTED_MODELS.add(model)
+                    break
+
+                elif is_transient:
+                    logger.warning(
+                        f"Model {model} hit transient error (Attempt {attempt}/{max_retries_per_model}): {err_msg}"
                     )
                     if attempt < max_retries_per_model:
                         time.sleep(delay)
                         delay *= 2.0
                     else:
                         logger.warning(
-                            f"Exhausted retries for {model}. Marking as exhausted for session and falling back..."
+                            f"Exhausted retries for {model}. Blacklisting globally across all threads..."
                         )
-                        EXHAUSTED_MODELS.add(model)
+                        with EXHAUSTED_LOCK:
+                            EXHAUSTED_MODELS.add(model)
+                        break
                 else:
-                    # Non-retryable error (e.g. invalid arguments); raise immediately
                     raise e
 
+    with EXHAUSTED_LOCK:
+        blacklisted = list(EXHAUSTED_MODELS)
     raise RuntimeError(
-        f"All requested models failed due to quota, capacity limits, or server errors: {models_in_priority}"
+        f"All candidate models exhausted or failed: {models_in_priority}. Blacklisted set: {blacklisted}"
     )
 
 
-# =====================================================================
-# 4. PIPELINE PHASES
-# =====================================================================
+def extract_raw_text_from_file_object(file_obj: Any) -> str:
+    """Extracts plain text from PDF files or stream objects."""
+    content_bytes = None
 
-def _map_phase(
-    chunks: List[str], client: genai.Client, model_candidates: List[str]
-) -> List[Dict[str, Any]]:
-    intermediate_extractions = []
+    if hasattr(file_obj, "file"):
+        file_obj.file.seek(0)
+        content_bytes = file_obj.file.read()
+    elif hasattr(file_obj, "read"):
+        if callable(file_obj.read):
+            content_bytes = file_obj.read()
+    elif isinstance(file_obj, bytes):
+        content_bytes = file_obj
+    elif isinstance(file_obj, str) and os.path.exists(file_obj):
+        reader = pypdf.PdfReader(file_obj)
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n\n".join(pages)
+
+    if not content_bytes:
+        raise ValueError("Could not read binary content from uploaded file.")
+
+    reader = pypdf.PdfReader(io.BytesIO(content_bytes))
+    extracted_pages = []
+    for idx, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        if text.strip():
+            extracted_pages.append(f"--- PAGE {idx + 1} ---\n{text}")
+
+    return "\n\n".join(extracted_pages).strip()
+
+
+def chunk_text(text: str, chunk_size: int = 12000, overlap: int = 1500) -> List[str]:
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start += chunk_size - overlap
+    return chunks
+
+
+def index_chunks_in_chroma(
+    chunks: List[str], embedder: Any, chroma_client: Any, collection_name: str = "phase1_specs"
+):
+    if not chroma_client or not embedder:
+        return
+
+    try:
+        logger.info(f"Indexing {len(chunks)} chunk(s) into ChromaDB collection '{collection_name}'...")
+        collection = chroma_client.get_or_create_collection(name=collection_name)
+        
+        embeddings = embedder.encode(chunks).tolist() if hasattr(embedder, "encode") else None
+        ids = [f"chunk_{i}" for i in range(len(chunks))]
+        
+        if embeddings:
+            collection.upsert(ids=ids, documents=chunks, embeddings=embeddings)
+        else:
+            collection.upsert(ids=ids, documents=chunks)
+            
+        logger.info("ChromaDB indexing complete.")
+    except Exception as e:
+        logger.warning(f"Failed to index chunks into ChromaDB: {e}")
+
+
+def map_chunk_worker(
+    idx: int,
+    total_chunks: int,
+    chunk: str,
+    client: genai.Client,
+    model_candidates: List[str],
+) -> Optional[Dict[str, Any]]:
+    logger.info(f"Processing chunk {idx}/{total_chunks}...")
+
+    prompt = f"""You are a senior technical specification extraction system.
+Extract all structural software architecture elements from this document chunk into a JSON structure.
+
+Include:
+- Functional modules/services and snake_case target module names derived directly from the text.
+- Business rules, domain policies, validation logic, and edge cases.
+- Function signatures with explicit parameter names, types, and return types.
+- System, domain, and validation exceptions/errors.
+- Cross-cutting constraints and technical guardrails (e.g. security, tenant isolation, path traversal, rate limits, concurrency, time/timezones, data retention, error recovery, background jobs).
+
+Output MUST be standard JSON. Do NOT prefix array elements with numeric keys (e.g., do NOT write `0: {{}}`).
+
+Document Chunk:
+{chunk}
+"""
 
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
@@ -210,117 +250,148 @@ def _map_phase(
         ),
     )
 
-    for idx, chunk in enumerate(chunks, start=1):
-        logger.info(f"Map Phase: Processing chunk {idx}/{len(chunks)}...")
-        prompt = f"{MAP_SYSTEM_PROMPT}\n\nText Segment ({idx}/{len(chunks)}):\n{chunk}"
-
-        response = _call_gemini_with_fallback(
+    try:
+        response = call_gemini_with_fallback(
             client=client,
             models_in_priority=model_candidates,
             contents=prompt,
             config=config,
         )
-
         if response and response.text:
-            try:
-                data = json.loads(response.text)
-                intermediate_extractions.append(data)
-            except json.JSONDecodeError:
-                logger.warning(
-                    f"Failed to parse JSON for chunk {idx}. Continuing..."
-                )
-
-        time.sleep(1.0)
-
-    return intermediate_extractions
+            cleaned = clean_json_text(response.text)
+            parsed = json.loads(cleaned)
+            return normalize_dict_lists(parsed)
+    except json.JSONDecodeError as err:
+        logger.warning(f"Failed to parse JSON response for chunk {idx}: {err}")
+    except Exception as e:
+        logger.error(f"Error processing chunk {idx}: {e}")
+    return None
 
 
-def _reduce_phase(
-    intermediate_data: List[Dict[str, Any]],
-    client: genai.Client,
-    model_candidates: List[str],
-    response_schema: Type[BaseModel],
+def run_extraction_pipeline(
+    files: Any,
+    gemini_key: str,
+    embedder: Optional[Any] = None,
+    chroma_client: Optional[Any] = None,
+    response_schema: Optional[Type[BaseModel]] = None,
+    model_priority: Optional[List[str]] = None,
+    max_parallel_workers: int = 4,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
-    logger.info(
-        "Reduce Phase: Consolidating extractions into final specification schema..."
-    )
+    reset_exhausted_models()
 
-    prompt = f"""
-{REDUCE_SYSTEM_PROMPT}
+    if not gemini_key:
+        raise ValueError("Missing GEMINI_API_KEY.")
 
-Collected Raw System Extractions:
-{json.dumps(intermediate_data)}
+    if not model_priority:
+        model_priority = [
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.5-flash",
+        ]
 
-Task:
-Consolidate all functional features and cross-cutting architectural constraints strictly according to the response schema.
+    client = genai.Client(api_key=gemini_key)
+
+    file_list = files if isinstance(files, list) else [files]
+    extracted_texts = []
+    for f in file_list:
+        text = extract_raw_text_from_file_object(f)
+        if text.strip():
+            extracted_texts.append(text)
+
+    raw_text = "\n\n".join(extracted_texts).strip()
+    if not raw_text:
+        raise ValueError("Unable to extract text from uploaded document(s).")
+
+    chunks = chunk_text(raw_text, chunk_size=12000, overlap=1500)
+    logger.info(f"Document chunked into {len(chunks)} segment(s).")
+
+    if embedder and chroma_client:
+        index_chunks_in_chroma(chunks, embedder, chroma_client)
+
+    intermediate_results = {}
+    if len(chunks) == 1:
+        res = map_chunk_worker(1, 1, chunks[0], client, model_priority)
+        if res:
+            intermediate_results[1] = res
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel_workers) as executor:
+            future_to_idx = {
+                executor.submit(
+                    map_chunk_worker, idx, len(chunks), chunk, client, model_priority
+                ): idx
+                for idx, chunk in enumerate(chunks, start=1)
+            }
+
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                res = future.result()
+                if res:
+                    intermediate_results[idx] = res
+
+    ordered_extractions = [
+        intermediate_results[i] for i in sorted(intermediate_results.keys())
+    ]
+
+    logger.info("Reduce Phase: Consolidating extractions into final specification schema...")
+
+    reduce_prompt = f"""You are a principal software architect. Consolidate these chunk-level extractions into a complete, unified software specification schema in JSON format matching the response schema.
+
+CONSOLIDATION & STRUCTURAL REQUIREMENTS:
+1. "features" MUST be a standard JSON array of feature objects (`[...]`). Do NOT use key-indexed objects (e.g. do not use "0", "1") or array prefixes like `0: {{}}`.
+2. DYNAMIC MODULE CONSOLIDATION (PREVENT OVER-FRAGMENTATION):
+   - Do NOT create tiny, granular micro-modules (e.g. avoid separate modules for comments, invitations, password reset, or dashboard).
+   - Dynamically aggregate all related capabilities into AT MOST 3 to 5 core macro domain contexts based on shared entity boundaries and relationships (e.g. aggregate identity/accounts/invitations into one identity context; projects/tasks/comments into one work execution context).
+   - Dynamically assign a clean, snake_case `target_module` name for each macro domain context.
+   - Deduplicate and merge all business rules, function signatures, and exception classes within each consolidated macro-module.
+3. Extract all cross-cutting, architectural, security, performance, and operational constraints into the `cross_cutting_constraints` list. Each entry must have a snake_case `category_name` (e.g., `security_and_authorization`, `concurrency_and_locking`, `temporal_and_timezones`, `background_processing_and_retries`, `data_retention`) and a list of explicit `rules`.
+4. Every rule entry under `cross_cutting_constraints` must contain explicit, actionable text extracted from the document. Do NOT output generic placeholder functions or empty signatures.
+
+Chunk Extractions:
+{json.dumps(ordered_extractions, indent=2)}
 """
 
-    config = types.GenerateContentConfig(
+    reduce_config = types.GenerateContentConfig(
         response_mime_type="application/json",
-        response_schema=response_schema,
         temperature=0.1,
         automatic_function_calling=types.AutomaticFunctionCallingConfig(
             disable=True
         ),
     )
+    if response_schema:
+        reduce_config.response_schema = response_schema
 
-    response = _call_gemini_with_fallback(
+    reduce_response = call_gemini_with_fallback(
         client=client,
-        models_in_priority=model_candidates,
-        contents=prompt,
-        config=config,
+        models_in_priority=model_priority,
+        contents=reduce_prompt,
+        config=reduce_config,
     )
 
-    if response and response.text:
-        return json.loads(response.text)
+    raw_data = None
+    if hasattr(reduce_response, "parsed") and reduce_response.parsed:
+        parsed_data = reduce_response.parsed
+        if hasattr(parsed_data, "model_dump"):
+            raw_data = parsed_data.model_dump()
+        elif hasattr(parsed_data, "dict"):
+            raw_data = parsed_data.dict()
 
-    raise RuntimeError("Reduce phase failed to output valid schema JSON.")
+    if not raw_data and reduce_response and reduce_response.text:
+        cleaned = clean_json_text(reduce_response.text)
+        raw_data = json.loads(cleaned)
+
+    if raw_data:
+        normalized_data = normalize_dict_lists(raw_data)
+        if response_schema:
+            try:
+                validated_model = response_schema.model_validate(normalized_data)
+                return validated_model.model_dump()
+            except Exception as val_err:
+                logger.warning(f"Pydantic schema re-validation notice: {val_err}")
+                return normalized_data
+        return normalized_data
+
+    raise RuntimeError("Failed to obtain valid specification output from Gemini.")
 
 
-# =====================================================================
-# 5. MAIN ENTRY POINT
-# =====================================================================
-
-def run_extraction_pipeline(
-    files: List[Any],
-    gemini_key: str,
-    embedder: Any = None,
-    chroma_client: Any = None,
-    response_schema: Optional[Type[BaseModel]] = None,
-) -> Dict[str, Any]:
-
-    global EXHAUSTED_MODELS
-    EXHAUSTED_MODELS.clear()  # Reset Circuit Breaker for each new run
-
-    target_schema = response_schema or SystemSpecification
-
-    raw_text = _extract_text_from_uploads(files)
-    if not raw_text.strip():
-        raise ValueError("No text could be extracted from the uploaded files.")
-
-    chunks = _chunk_text_contiguous(raw_text)
-    logger.info(
-        f"Split raw document ({len(raw_text)} chars) into {len(chunks)} contiguous chunks."
-    )
-
-    client = genai.Client(api_key=gemini_key)
-
-    # Candidate models in order of priority
-    model_candidates = [
-        "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-3.5-flash",
-    ]
-
-    raw_extractions = _map_phase(
-        chunks, client, model_candidates=model_candidates
-    )
-
-    final_spec = _reduce_phase(
-        raw_extractions,
-        client,
-        model_candidates=model_candidates,
-        response_schema=target_schema,
-    )
-
-    return final_spec
+extract_document_spec = run_extraction_pipeline
