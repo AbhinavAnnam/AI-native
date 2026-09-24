@@ -6,6 +6,7 @@ import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
 from google import genai
 from google.genai import types
@@ -15,6 +16,115 @@ from mcp_tools.file_tools import MCPToolServer
 from phase2_coder.hitl_manager import hitl_queue
 
 logger = logging.getLogger(__name__)
+
+# Token budgets. Gemini 2.5/3.x models spend part of the budget on internal
+# "thinking", so a tight cap silently truncates the emitted code.
+GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "8192"))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "32768"))
+
+
+def _looks_truncated(code: str) -> bool:
+    """Heuristic: unbalanced brackets/quotes mean the model was cut off mid-output."""
+    if not code:
+        return True
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack = []
+    in_str = None
+    escaped = False
+    for ch in code:
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+        elif ch in "([{":
+            stack.append(ch)
+        elif ch in pairs:
+            if not stack or stack[-1] != pairs[ch]:
+                return True
+            stack.pop()
+    return bool(stack) or in_str is not None
+
+
+def _render_functions(functions) -> str:
+    """Renders Phase-1 function specs (dicts or plain strings) as readable bullets."""
+    if not functions:
+        return "- (none specified; implement the business rules above)"
+    lines = []
+    for fn in functions:
+        if isinstance(fn, dict):
+            sig = fn.get("signature", "unknown_signature")
+            purpose = fn.get("purpose", "")
+            lines.append(f"- `{sig}` -> {purpose}")
+        else:
+            lines.append(f"- `{fn}`")
+    return "\n".join(lines)
+
+
+# Typographic look-alikes LLMs substitute for ASCII punctuation. They are legal
+# inside strings/comments (so AST checks pass) but they are never what is wanted
+# in generated source, and inside a string literal they silently change behaviour
+# (e.g. comparing "ISO-8601" != "ISO\u20118601"). Normalise them away.
+_TYPOGRAPHIC_MAP = str.maketrans(
+    {
+        "\u2010": "-",  # hyphen
+        "\u2011": "-",  # non-breaking hyphen
+        "\u2012": "-",  # figure dash
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2015": "-",  # horizontal bar
+        "\u2212": "-",  # minus sign
+        "\u00a0": " ",  # non-breaking space
+        "\u2007": " ",  # figure space
+        "\u2009": " ",  # thin space
+        "\u202f": " ",  # narrow no-break space
+        "\u2018": "'",  # left single quote
+        "\u2019": "'",  # right single quote
+        "\u201c": '"',  # left double quote
+        "\u201d": '"',  # right double quote
+    }
+)
+
+
+def _sanitize_generated_code(code: str) -> str:
+    """Normalises typographic punctuation to ASCII in model-generated source.
+
+    Accented letters and other genuine Unicode text are left untouched; only
+    punctuation look-alikes are rewritten. If the rewrite would corrupt a string
+    literal (e.g. a curly quote closing a quote early), the original is kept.
+    """
+    if not code or code.isascii():
+        return code
+
+    dash_space_only = str.maketrans(
+        {
+            "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
+            "\u2014": "-", "\u2015": "-", "\u2212": "-",
+            "\u00a0": " ", "\u2007": " ", "\u2009": " ", "\u202f": " ",
+        }
+    )
+    full = code.translate(_TYPOGRAPHIC_MAP)
+    punctuation_only = code.translate(dash_space_only)
+
+    import ast as _ast
+
+    for candidate in (full, punctuation_only, code):
+        try:
+            _ast.parse(candidate)
+            if candidate != code:
+                logger.info(
+                    "Coder Agent: normalised typographic punctuation to ASCII "
+                    "in generated source."
+                )
+            return candidate
+        except SyntaxError:
+            continue
+    return code
 
 
 class CoderAgent:
@@ -115,10 +225,18 @@ class CoderAgent:
                     model=model_slug,
                     messages=[system_msg, {"role": "user", "content": prompt}],
                     temperature=0.1,
-                    max_tokens=8192,
+                    max_tokens=GROQ_MAX_TOKENS,
                 )
-                if response.choices[0].message.content:
-                    return response.choices[0].message.content
+                choice = response.choices[0]
+                code = choice.message.content
+                if code:
+                    if getattr(choice, "finish_reason", None) == "length":
+                        logger.warning(
+                            f"Groq '{model_slug}' output was TRUNCATED (hit the "
+                            f"{GROQ_MAX_TOKENS}-token ceiling). Rejecting this draft."
+                        )
+                        continue
+                    return code
             except Exception as e:
                 logger.warning(
                     f"Tier 1 Groq ('{model_slug}') failed on {task_type} task ({e}). Rotating model..."
@@ -126,7 +244,7 @@ class CoderAgent:
 
         # Tier 2: Gemini Fallback Chain
         gemini_models = [
-            "gemini-3.8-flash"
+            "gemini-3.8-flash",
             "gemini-3.7-flash",
             "gemini-2.5-pro",
             "gemini-3.5-flash",
@@ -134,25 +252,26 @@ class CoderAgent:
         ]
 
         full_gemini_prompt = f"{system_msg['content']}\n\nTask Instructions:\n{prompt}"
+        completeness_nudge = (
+            "\n\nIMPORTANT: Your previous response was cut off before the file was "
+            "finished. Send the ENTIRE file again from the first import to the final "
+            "return. If it is large, implement the listed functions fully and "
+            "concisely - never stop mid-function or leave a block unclosed."
+        )
 
         for model_name in gemini_models:
             try:
                 logger.info(
                     f"Coder Agent: Executing Tier 2 fallback with '{model_name}'..."
                 )
-                response = self.gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=full_gemini_prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        max_output_tokens=8192,
-                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                            disable=True
-                        ),
-                    ),
-                )
-                if response and response.text:
-                    return response.text
+                text = self._gemini_generate_text(model_name, full_gemini_prompt)
+                if not text:
+                    # Unusable output: re-ask once with an explicit completion instruction.
+                    text = self._gemini_generate_text(
+                        model_name, full_gemini_prompt + completeness_nudge
+                    )
+                if text:
+                    return text
             except Exception as e:
                 logger.warning(
                     f"Gemini fallback on '{model_name}' failed: {e}"
@@ -162,17 +281,78 @@ class CoderAgent:
             "All code generation endpoints across all tiers failed."
         )
 
-    def _process_single_feature(self, feature: dict, index: int = 0) -> dict:
+    def _gemini_generate_text(self, model_name: str, contents: str) -> Optional[str]:
+        """Generates with Gemini, returning None when the output is unusable.
+
+        Gemini 2.5/3.x reserve part of ``max_output_tokens`` for internal reasoning,
+        so a tight ceiling silently truncates the emitted code into invalid Python.
+        This guard rejects truncated output and retries with a smaller budget if the
+        model itself refuses the larger one.
+        """
+        for cap in (GEMINI_MAX_OUTPUT_TOKENS, 8192):
+            try:
+                response = self.gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=cap,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
+                        ),
+                    ),
+                )
+            except Exception as exc:
+                if cap == GEMINI_MAX_OUTPUT_TOKENS:
+                    logger.warning(
+                        f"Gemini '{model_name}' rejected a {cap}-token budget ({exc}). "
+                        f"Retrying with 8192."
+                    )
+                    continue
+                raise
+
+            if not (response and response.text):
+                return None
+
+            try:
+                finish_reason = str(response.candidates[0].finish_reason)
+            except Exception:
+                finish_reason = ""
+
+            if "MAX_TOKENS" in finish_reason.upper():
+                logger.warning(
+                    f"Gemini '{model_name}' hit the {cap}-token ceiling (output truncated)."
+                )
+                return None
+
+            if _looks_truncated(response.text):
+                logger.warning(
+                    f"Gemini '{model_name}' returned unbalanced code (likely truncated)."
+                )
+                return None
+
+            return response.text
+
+        return None
+
+    def _process_single_feature(self, feature: dict, index: int = 0, revision_notes: str = "") -> dict:
         if index > 0:
             time.sleep(index * 1.5)
 
         module_name = feature.get("target_module", "unnamed_module")
         logger.info(f"Coder Agent: Synthesizing module '{module_name}'...")
 
+        revision_block = ""
+        if revision_notes:
+            revision_block = (
+                "\nHUMAN REVISION REQUEST (highest priority - the code MUST honour this):\n"
+                f"{revision_notes}\n"
+            )
+
         base_prompt = f"""
 Target Module: {module_name}
 Feature Domain: {feature.get('feature_name')}
-
+{revision_block}
 Business Rules to Enforce:
 {json.dumps(feature.get('business_rules', []), indent=2)}
 
@@ -180,13 +360,15 @@ Exceptions to Define and Handle:
 {json.dumps(feature.get('exceptions', []), indent=2)}
 
 Functions / Logic to Fully Implement:
-{json.dumps(feature.get('functions', []), indent=2)}
+{_render_functions(feature.get('functions', []))}
 
 Instructions:
 - Write complete, syntactically valid Python code for the ENTIRE module from imports to final returns.
+- Implement every function listed above with its exact signature, type hints and return type.
 - Define every exception class explicitly at the top of the file before raising it.
-- Ensure cross-cutting rules are handled (calendar-day dates, case-insensitive emails, side-effect isolation).
-- Do not cut off code early or use placeholder 'pass' statements inside core logic.
+- Handle the business rules literally (no invented behaviour, no unrelated utility helpers).
+- Output a COMPLETE file: never stop mid-function, never leave a block unclosed, never use placeholder 'pass' inside core logic.
+- Keep the module focused on THIS module's responsibility only.
 """
 
         max_repair_attempts = 3
@@ -217,15 +399,25 @@ Instructions:
             clean_code = re.sub(r"^```python\s*", "", clean_code, flags=re.MULTILINE)
             clean_code = re.sub(r"^```\s*$", "", clean_code, flags=re.MULTILINE).strip()
 
+            # Normalise typographic punctuation the model may have substituted for ASCII
+            clean_code = _sanitize_generated_code(clean_code)
+
             # 1. MCP AST Syntax Check
             is_valid, validation_msg = MCPToolServer.validate_python_syntax(clean_code)
             if not is_valid:
-                logger.warning(f"Attempt {attempt} syntax check failed: {validation_msg}")
+                truncated = _looks_truncated(clean_code)
+                logger.warning(
+                    f"Attempt {attempt} syntax check failed "
+                    f"({'TRUNCATED output' if truncated else 'invalid syntax'}): {validation_msg}"
+                )
                 current_prompt = (
                     f"{base_prompt}\n\n"
                     f"CRITICAL FIX REQUIRED (Attempt {attempt}):\n"
-                    f"Your previous output contained a syntax error:\n{validation_msg}\n"
-                    f"Fix the error and output complete, executable Python code."
+                    f"Your previous output was "
+                    f"{'CUT OFF before it finished' if truncated else 'not valid Python'}:\n"
+                    f"{validation_msg}\n"
+                    f"Resend the ENTIRE corrected file from the first import to the final return. "
+                    f"Do not apologise or explain - output only the complete code."
                 )
                 continue
 
@@ -280,6 +472,18 @@ Instructions:
         if self.staging_dir.exists():
             shutil.rmtree(self.staging_dir, ignore_errors=True)
 
+        # Authoritative final re-validation of exactly what we are about to return,
+        # so the UI badge never disagrees with the code it is attached to.
+        if clean_code and not clean_code.startswith("# Error"):
+            final_valid, final_msg = MCPToolServer.validate_python_syntax(clean_code)
+            is_valid = final_valid
+            validation_msg = final_msg
+            if final_valid:
+                validation_msg = (
+                    f"{final_msg} Pytest: "
+                    f"{'passed' if tests_passed else 'not run'}."
+                )
+
         draft_id = f"draft_{module_name.replace('.', '_')}"
 
         return {
@@ -293,7 +497,16 @@ Instructions:
             "test_output": test_output,
         }
 
-    def generate_drafts_from_specs(self, specs_data: dict) -> list:
+    def generate_single_module(self, feature: dict, revision_notes: str = "") -> dict:
+        """Synthesizes ONE module through the full MCP-validated pipeline.
+
+        Exposed so the LangGraph agent gets the exact same quality gates as the
+        bulk Coder Agent run (prompt engineering, AST syntax guardrail, staged
+        pytest), instead of a raw single-shot LLM call.
+        """
+        return self._process_single_feature(feature, index=0, revision_notes=revision_notes)
+
+    def generate_drafts_from_specs(self, specs_data: dict, revision_notes: str = "") -> list:
         hitl_queue.clear()
         features = specs_data.get("features", [])
         if not features:
@@ -306,7 +519,7 @@ Instructions:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future_to_feature = {
                 executor.submit(
-                    self._process_single_feature, feature, idx
+                    self._process_single_feature, feature, idx, revision_notes
                 ): feature
                 for idx, feature in enumerate(features)
             }

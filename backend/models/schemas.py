@@ -1,6 +1,10 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
+
+# ==========================================
+# Phase 1: Specification Extraction Schemas
+# ==========================================
 
 class FunctionSpec(BaseModel):
     signature: str = Field(
@@ -46,15 +50,64 @@ class ProjectSpecs(BaseModel):
     )
 
 
+# ==========================================
+# Phase 2: HITL & Code Commit Schemas
+# ==========================================
+
 class HITLApprovalPayload(BaseModel):
-    approved: bool = Field(
-        description="Whether the generated specification or execution plan is approved by the human."
+    action: Optional[Literal["approve", "reject"]] = Field(
+        default="approve",
+        description="Approval action choice ('approve' or 'reject')."
+    )
+    draft_id: Optional[str] = Field(
+        default=None,
+        description="Unique identifier of the code draft under review."
+    )
+    target_module: Optional[str] = Field(
+        default=None,
+        description="Target module identifier (e.g., iam_identity)."
+    )
+    approved_code: Optional[str] = Field(
+        default=None,
+        description="Final approved code to commit to disk."
+    )
+    approved: Optional[bool] = Field(
+        default=True,
+        description="Boolean approval status."
     )
     feedback: Optional[str] = Field(
         default=None,
-        description="Optional feedback or revision notes if rejected or modified.",
+        description="Optional feedback or revision notes."
     )
     modified_spec: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Optional modified spec object passed back from the user interface.",
+        description="Optional modified spec object passed back from the UI."
+    )
+
+
+# ==========================================
+# Phase 2: LangGraph Agent Engine Schemas
+# ==========================================
+
+class TaskClassification(BaseModel):
+    task_type: Literal["simple_query", "architecture_planning", "code_generation", "code_refinement"] = Field(
+        ..., description="Classified type of incoming task."
+    )
+    recommended_model: Literal["fast", "heavy"] = Field(
+        ..., description="'fast' for simple queries; 'heavy' for complex architectural/code tasks."
+    )
+    reasoning: str = Field(..., description="Brief explanation for routing choice.")
+
+
+class StartExecutionRequest(BaseModel):
+    thread_id: str = Field(..., description="Unique thread identifier for state persistence.")
+    task_spec: str = Field(..., description="Task or module specification prompt to execute.")
+
+
+class HumanFeedbackRequest(BaseModel):
+    thread_id: str = Field(..., description="Unique thread identifier for state persistence.")
+    user_feedback: str = Field(..., description="Human review input or revision feedback.")
+    modified_spec: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional modified spec object passed back from the UI.",
     )

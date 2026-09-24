@@ -1,3 +1,6 @@
+import json
+import uuid
+
 import streamlit as st
 import requests
 
@@ -10,6 +13,21 @@ if "extracted_specs" not in st.session_state:
     st.session_state.extracted_specs = None
 if "pending_reviews" not in st.session_state:
     st.session_state.pending_reviews = []
+if "agent_thread_id" not in st.session_state:
+    st.session_state.agent_thread_id = str(uuid.uuid4())
+if "agent_status" not in st.session_state:
+    st.session_state.agent_status = None
+if "agent_output" not in st.session_state:
+    st.session_state.agent_output = ""
+if "agent_completed" not in st.session_state:
+    st.session_state.agent_completed = False
+if "agent_modules" not in st.session_state:
+    st.session_state.agent_modules = []
+if "agent_task_spec" not in st.session_state:
+    st.session_state.agent_task_spec = ""
+if "agent_task_seed" not in st.session_state:
+    st.session_state.agent_task_seed = None
+
 
 def fetch_logs():
     try:
@@ -137,6 +155,124 @@ with col_main:
                                 requests.post("http://127.0.0.1:8000/api/phase2/approve-and-commit", json=payload)
                                 item["status"] = "REJECTED"
                                 st.rerun()
+
+        # ------------------------------------------------------------------
+        # Agent Studio (LangGraph Human-in-the-Loop Stream)
+        # ------------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("🤖 Agent Studio — LangGraph Human-in-the-Loop")
+        st.caption(
+            "This drives the real LangChain/LangGraph agent. It creates a draft, pauses, then waits for your "
+            "feedback. Type an approval keyword (e.g. 'approve', 'looks good') to accept it, or type revision "
+            "instructions to regenerate the output."
+        )
+
+        # Seed the text area from the extracted specs. A widget with a fixed `key`
+        # ignores `value=` on every later rerun, which previously meant the agent
+        # received an EMPTY spec (and synthesised a generic `generated_module`).
+        spec_seed = (
+            json.dumps(st.session_state.extracted_specs, indent=2)
+            if st.session_state.extracted_specs
+            else ""
+        )
+        if st.session_state.get("agent_task_seed") != spec_seed:
+            st.session_state.agent_task_seed = spec_seed
+            st.session_state.agent_task_spec = spec_seed
+
+        task_spec = st.text_area(
+            "Task specification for the agent (auto-filled from Phase 1 extraction)",
+            height=160,
+            key="agent_task_spec",
+        )
+
+        col_start, col_clear = st.columns(2)
+        with col_start:
+            if st.button("▶️ Start Agent", type="primary"):
+                if not task_spec.strip():
+                    st.warning(
+                        "The task specification is empty. Run Phase 1 extraction first, "
+                        "or paste a spec JSON here."
+                    )
+                else:
+                    with st.spinner("Agent is classifying the spec, then synthesizing code via the CoderAgent + MCP tools..."):
+                        try:
+                            resp = requests.post(
+                                "http://127.0.0.1:8000/api/phase2/start",
+                                json={
+                                    "thread_id": st.session_state.agent_thread_id,
+                                    "task_spec": task_spec,
+                                },
+                                timeout=900,
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                st.session_state.agent_status = data.get("status")
+                                st.session_state.agent_output = data.get("generated_output") or ""
+                                st.session_state.agent_modules = data.get("modules") or []
+                                st.session_state.agent_completed = False
+                                st.rerun()
+                            else:
+                                st.error(f"Agent start error ({resp.status_code}): {resp.text}")
+                        except Exception as e:
+                            st.error(f"Agent start request failed: {e}")
+                        finally:
+                            fetch_logs()
+        with col_clear:
+            if st.button("🔄 New Thread"):
+                st.session_state.agent_thread_id = str(uuid.uuid4())
+                st.session_state.agent_status = None
+                st.session_state.agent_output = ""
+                st.session_state.agent_modules = []
+                st.session_state.agent_completed = False
+                st.rerun()
+
+        if st.session_state.agent_output:
+            st.write(f"**Status:** `{st.session_state.agent_status}`")
+
+            if st.session_state.agent_modules:
+                st.markdown("**Modules generated this pass**")
+                for mod in st.session_state.agent_modules:
+                    ok = "✅" if mod.get("syntax_valid") else "⚠️"
+                    st.markdown(
+                        f"- {ok} `{mod.get('target_module')}` — {mod.get('validation_msg')}"
+                    )
+
+            if st.session_state.agent_completed:
+                st.success("✅ Agent approved — modules committed to `generated_src/`.")
+            else:
+                st.info("⏸️ Agent is paused and waiting for your feedback.")
+            st.code(st.session_state.agent_output, language="python")
+
+            if not st.session_state.agent_completed:
+                feedback = st.text_input(
+                    "Your feedback (e.g. 'approve' / 'looks good', or revision notes)",
+                    key="agent_feedback",
+                )
+                if st.button("📨 Submit Feedback"):
+                    with st.spinner("Applying feedback and continuing the agent..."):
+                        try:
+                            resp = requests.post(
+                                "http://127.0.0.1:8000/api/phase2/feedback",
+                                json={
+                                    "thread_id": st.session_state.agent_thread_id,
+                                    "user_feedback": feedback,
+                                },
+                                timeout=900,
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                st.session_state.agent_status = data.get("status")
+                                st.session_state.agent_output = data.get("latest_output") or st.session_state.agent_output
+                                st.session_state.agent_modules = data.get("modules") or st.session_state.agent_modules
+                                st.session_state.agent_completed = bool(data.get("is_completed"))
+                                st.rerun()
+                            else:
+                                st.error(f"Feedback error ({resp.status_code}): {resp.text}")
+                        except Exception as e:
+                            st.error(f"Feedback request failed: {e}")
+                        finally:
+                            fetch_logs()
+
 
 with col_logs:
     st.subheader("System Execution Logs")
