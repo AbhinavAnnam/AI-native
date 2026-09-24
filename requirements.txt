@@ -5,10 +5,21 @@ pydantic
 python-dotenv
 sentence-transformers
 pypdf
+python-docx
+
+# LangChain / LangGraph (Phase 2 Agent Engine)
+langchain
+langchain-core
+langchain-google-genai
+langgraph
+openai
 
 # Backend Service
 fastapi
 uvicorn
+
+# Testing
+pytest
 
 # Frontend UI & API Client
 streamlit

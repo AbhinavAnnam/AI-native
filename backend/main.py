@@ -20,6 +20,8 @@ from routers.phase1_router import router as phase1_router
 from routers.phase2_router import router as phase2_router
 from routers.logs_router import router as logs_router
 
+logger = logging.getLogger(__name__)
+
 
 def configure_logging():
     logger = logging.getLogger()
@@ -35,6 +37,18 @@ def configure_logging():
     logger.addHandler(stream_handler)
     for noisy in ["httpx", "transformers", "urllib3", "sentence_transformers", "chromadb"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def clear_generated_workspace(base_dir: str = "generated_src") -> str:
+    """Deletes and recreates the generated source workspace directory."""
+    import shutil
+
+    abs_dir = os.path.abspath(base_dir)
+    if os.path.exists(abs_dir):
+        shutil.rmtree(abs_dir, ignore_errors=True)
+    os.makedirs(abs_dir, exist_ok=True)
+    logger.info(f"Cleared and recreated generated workspace at {abs_dir}")
+    return abs_dir
 
 
 configure_logging()

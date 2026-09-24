@@ -1,0 +1,253 @@
+{
+  "project_title": "collaboration_platform",
+  "features": [
+    {
+      "feature_name": "Identity Management",
+      "target_module": "identity_management",
+      "business_rules": [
+        "Email addresses are case\u2011insensitive for lookup; a person joining two organizations uses the same account.",
+        "Failed email delivery should not cause underlying assignment or mention to be rolled back."
+      ],
+      "functions": [
+        {
+          "signature": "def register_account(email_address: str, password: str) -> account_record",
+          "purpose": "Creates a new user account; requires email verification before the account becomes fully active."
+        },
+        {
+          "signature": "def request_password_reset(email_address: str) -> reset_token",
+          "purpose": "Generates a temporary password\u2011reset token without revealing whether the email exists; token is short\u2011lived."
+        },
+        {
+          "signature": "def check_auth(user_id: str, action: str, resource: str) -> bool",
+          "purpose": "Verifies that the given user is authenticated and authorized to perform the specified action on the resource."
+        }
+      ],
+      "exceptions": [
+        "ValidationException",
+        "AuthorizationException",
+        "ServerException",
+        "DependencyFailure"
+      ]
+    },
+    {
+      "feature_name": "Organization Management",
+      "target_module": "organization_management",
+      "business_rules": [
+        "Organizations are isolated; a member of one organization cannot access another regardless of email overlap.",
+        "Roles follow a hierarchy: owner, administrator, member; only one owner at a time.",
+        "Ownership transfer requires the new owner to already belong to the organization.",
+        "Data visibility inherits from parent objects to avoid per\u2011child authorization rules."
+      ],
+      "functions": [
+        {
+          "signature": "def create_organization(name: str, identifier: Optional[str] = None) -> organization_id",
+          "purpose": "Creates a new organization; the first user becomes the initial owner."
+        },
+        {
+          "signature": "def invite_member(email_address: str, organization_id: str) -> invitation_record",
+          "purpose": "Sends an invitation to join an organization; invitations expire and can be revoked."
+        },
+        {
+          "signature": "def transfer_ownership(organization_id: str, new_owner_id: str) -> success_status",
+          "purpose": "Transfers organization ownership to an existing member; records the action in activity history."
+        }
+      ],
+      "exceptions": [
+        "ValidationException",
+        "AuthorizationException",
+        "DuplicateRecordError",
+        "DependencyFailure"
+      ]
+    },
+    {
+      "feature_name": "Work Management",
+      "target_module": "work_management",
+      "business_rules": [
+        "Projects can be created, completed, or archived; archived projects remain inspectable but are hidden from primary lists.",
+        "Work items have statuses (not_completed, in_progress, completed) and can move back to active state.",
+        "Historical activity is append\u2011only; users cannot rewrite past events.",
+        "Comments are stored as untrusted input and must be escaped before rendering.",
+        "Notifications are generated for assignments, mentions, and follows; email failures do not roll back the underlying event.",
+        "Search respects organization and project access boundaries; users cannot discover inaccessible projects.",
+        "Dashboard counts are derived from currently accessible data, not from a permanent truth source.",
+        "Due dates are calendar days independent of viewer timezone.",
+        "Concurrency strategy: last\u2011write is acceptable for simple fields; stronger guarantees for membership changes or ownership transfer."
+      ],
+      "functions": [
+        {
+          "signature": "def create_project(name: str, description: str, creator_id: str) -> project_id",
+          "purpose": "Creates a new project; the creator normally becomes the initial project owner."
+        },
+        {
+          "signature": "def create_work_item(project_id: str, title: str, status: str, priority: int, due_date: Optional[date] = None) -> work_item_id",
+          "purpose": "Creates a work item belonging to a project with required fields and optional due date."
+        },
+        {
+          "signature": "def add_comment(work_item_id: str, author_id: str, body: str) -> comment_id",
+          "purpose": "Adds an untrusted comment to a work item; content must be escaped."
+        },
+        {
+          "signature": "def upload_attachment(resource_id: str, file_content: bytes, filename: str) -> attachment_id",
+          "purpose": "Attaches a file to a work item or comment; filename is not trusted as a filesystem path."
+        },
+        {
+          "signature": "def search_operational_content(query: str, scope: authorization_scope) -> search_results",
+          "purpose": "Searches across operational content while enforcing organization and project access boundaries."
+        }
+      ],
+      "exceptions": [
+        "ValidationException",
+        "AuthorizationException",
+        "ServerException",
+        "DependencyFailure"
+      ]
+    },
+    {
+      "feature_name": "File Handling",
+      "target_module": "file_handling",
+      "business_rules": [
+        "Uploaded files may initially be in a processing state before becoming available for download.",
+        "Filenames must be sanitized to prevent path\u2011traversal (e.g., '../../' patterns).",
+        "File content is never auto\u2011interpreted as HTML or executable code; appropriate content\u2011disposition is applied.",
+        "Authentication and authorization are required before serving private files.",
+        "Temporary download URLs have a limited lifetime and must expire.",
+        "File upload size limits are enforced before data transfer begins.",
+        "Identical filenames from different users are allowed; each file is stored with a distinct internal identifier."
+      ],
+      "functions": [
+        {
+          "signature": "def upload_file(user_id: str, organization_id: str, file: File) -> UploadResponse",
+          "purpose": "Handles user\u2011initiated file upload after validation and size checks."
+        },
+        {
+          "signature": "def download_file(user_id: str, organization_id: str, file_id: str) -> FileResponse",
+          "purpose": "Serves a file to an authorized user with proper content\u2011disposition."
+        },
+        {
+          "signature": "def validate_file_name(file_name: str) -> bool",
+          "purpose": "Ensures the filename does not contain disallowed patterns such as path traversal."
+        },
+        {
+          "signature": "def enforce_upload_limit(file_size: int) -> None",
+          "purpose": "Raises an error if the file exceeds configured size limits."
+        },
+        {
+          "signature": "def generate_temporary_download_url(file_id: str, expires_in_seconds: int) -> str",
+          "purpose": "Creates a short\u2011lived URL for downloading a file."
+        },
+        {
+          "signature": "def content_disposition(file: File) -> str",
+          "purpose": "Generates a safe Content\u2011Disposition header to prevent inline execution of uploaded content."
+        }
+      ],
+      "exceptions": [
+        "FileUploadLimitExceededError",
+        "FileNameInvalidError",
+        "UnauthorizedAccessError",
+        "FileNotFoundError"
+      ]
+    },
+    {
+      "feature_name": "Background Processing",
+      "target_module": "background_processing",
+      "business_rules": [
+        "Background jobs must include target organization and resource identifiers independent of the browser session.",
+        "Jobs may be retried, but a job that repeatedly fails must not retry forever without operator visibility.",
+        "Failed background work must be investigable via operational tooling.",
+        "Email sending, search indexing, and notification generation are performed asynchronously.",
+        "Retry logic limits the number of attempts to avoid infinite loops."
+      ],
+      "functions": [
+        {
+          "signature": "def process_background_job(job_id: str, organization_id: str, resource_id: str) -> JobResult",
+          "purpose": "Executes a queued background job for the given organization and resource."
+        },
+        {
+          "signature": "def retry_job(job_id: str) -> RetryResult",
+          "purpose": "Attempts to re\u2011execute a failed background job respecting retry limits."
+        },
+        {
+          "signature": "def get_failed_jobs() -> List[JobInfo]",
+          "purpose": "Returns information about background jobs that have exceeded retry limits or failed permanently."
+        }
+      ],
+      "exceptions": [
+        "BackgroundJobFailedError",
+        "RetryLimitExceededError",
+        "DependencyFailure"
+      ]
+    }
+  ],
+  "cross_cutting_constraints": [
+    {
+      "category_name": "security_and_authorization",
+      "rules": [
+        "API authorization must enforce organization boundary beyond web interface.",
+        "Filename such as ../../something must never become direct filesystem location.",
+        "Uploaded file content not automatically interpreted as HTML or executable code.",
+        "Authentication must be applied before generating or serving private file access.",
+        "Prevent path traversal by sanitizing file names; disallow '../../' patterns.",
+        "Do not auto\u2011interpret file content as HTML or executable code; enforce content\u2011disposition.",
+        "Require authentication and authorization before serving private files."
+      ]
+    },
+    {
+      "category_name": "tenant_isolation",
+      "rules": [
+        "Background jobs must identify target organization and resource independent of session."
+      ]
+    },
+    {
+      "category_name": "temporal_and_timezones",
+      "rules": [
+        "Representing events should have unambiguous timezone interpretation.",
+        "Relative labels generated using relevant user or organization context, not stored as text.",
+        "Transitions should not cause logic to assume every calendar day has exactly same number of hours.",
+        "Temporary download URLs must expire after a limited lifetime."
+      ]
+    },
+    {
+      "category_name": "concurrency_and_locking",
+      "rules": [
+        "Operations that modify resources should allow retries without creating duplicate logical records.",
+        "Stronger guarantees necessary for membership changes or ownership transfer to prevent conflicting owners.",
+        "Background job processing should handle concurrent execution safely."
+      ]
+    },
+    {
+      "category_name": "reliability_and_resilience",
+      "rules": [
+        "Sending email, updating search indexes, generating notifications processed asynchronously.",
+        "Jobs that repeatedly fail should not retry forever without visibility to operators.",
+        "Provide operational tooling to investigate failed background jobs.",
+        "Limit retry attempts for background jobs to avoid infinite loops."
+      ]
+    },
+    {
+      "category_name": "data_retention",
+      "rules": [
+        "Historical information remains intelligible even if actor display name changes or account deactivated.",
+        "Removal should not rewrite old activity or cause work items to silently disappear."
+      ]
+    },
+    {
+      "category_name": "api_design_and_identifiers",
+      "rules": [
+        "Safe to expose to clients. Authorization must never depend on difficulty of guessing identifier.",
+        "Ordering needs to be stable enough that records are not randomly skipped or repeated."
+      ]
+    },
+    {
+      "category_name": "ui_ux",
+      "rules": [
+        "User with no assigned work should receive useful empty state rather than technical error."
+      ]
+    },
+    {
+      "category_name": "mobile_support",
+      "rules": [
+        "Mobile-specific behavior not part of initial product definition. Underlying API should not make mobile clients impossible later."
+      ]
+    }
+  ]
+}

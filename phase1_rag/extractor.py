@@ -6,24 +6,27 @@ import os
 import re
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Type, Union
 
 import pypdf
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
+from phase1_rag.providers import fallback_keys_available, generate_json
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
+# Set for permanently broken/non-existent models during a single execution run
 EXHAUSTED_MODELS = set()
 EXHAUSTED_LOCK = threading.Lock()
 
 
 def reset_exhausted_models():
-    """Resets the global blacklisted models set prior to starting an extraction pipeline."""
+    """Resets permanent model blacklists before extraction."""
     global EXHAUSTED_MODELS, EXHAUSTED_LOCK
     with EXHAUSTED_LOCK:
         EXHAUSTED_MODELS.clear()
@@ -40,7 +43,6 @@ def clean_json_text(text: str) -> str:
     if match:
         text = match.group(1).strip()
 
-    # Pre-parse syntax repair for pseudo-array key prefixes like '[ 0: {' or ', 1: {'
     text = re.sub(r'(\[\s*)\d+\s*:\s*', r'\1', text)
     text = re.sub(r',\s*\d+\s*:\s*', ', ', text)
 
@@ -63,90 +65,157 @@ def normalize_dict_lists(data: Any) -> Any:
     return data
 
 
+def minify_extractions(data: Any) -> Any:
+    """
+    Strips empty strings, nulls, and empty lists/dicts to minimize prompt payload size.
+    """
+    if isinstance(data, dict):
+        cleaned_dict = {
+            k: minify_extractions(v)
+            for k, v in data.items()
+            if v not in (None, "", [], {})
+        }
+        return {k: v for k, v in cleaned_dict.items() if v not in (None, "", [], {})}
+    elif isinstance(data, list):
+        cleaned_list = [
+            minify_extractions(item)
+            for item in data
+            if item not in (None, "", [], {})
+        ]
+        return [item for item in cleaned_list if item not in (None, "", [], {})]
+    return data
+
+
+def prune_payload_for_fallback(data: Any, max_chars: int = 12000) -> str:
+    """
+    Aggressively minifies and prunes intermediate extractions to ensure
+    the Reduce prompt payload fits within Groq's strict token/character limits (prevents 413 errors).
+    """
+    minified = minify_extractions(data)
+    json_str = json.dumps(minified, separators=(",", ":"))
+
+    if len(json_str) <= max_chars:
+        return json_str
+
+    # If payload is still too large for Groq, trim deeper redundant keys
+    logger.warning(f"Payload size ({len(json_str)} chars) exceeds Groq limit ({max_chars}). Compacting payload...")
+    
+    if isinstance(minified, list):
+        pruned_list = []
+        for item in minified:
+            if isinstance(item, dict):
+                # Keep core architectural keys, drop verbose explanations
+                pruned_item = {
+                    k: v for k, v in item.items()
+                    if k in ("features", "modules", "services", "functions", "cross_cutting_constraints")
+                }
+                pruned_list.append(pruned_item)
+            else:
+                pruned_list.append(item)
+        return json.dumps(pruned_list, separators=(",", ":"))
+
+    return json_str
+
+
+def generate_json_with_retry(contents: str, response_schema: Any = None, max_retries: int = 2) -> Any:
+    """
+    Calls generate_json with backoff retry to handle transient Groq 429 Rate Limit errors
+    without triggering long OpenRouter fallbacks.
+    """
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            return generate_json(contents, response_schema=response_schema)
+        except Exception as e:
+            last_err = e
+            err_msg = str(e)
+            if "429" in err_msg and attempt < max_retries:
+                wait_time = (attempt + 1) * 1.5
+                logger.warning(f"Groq Rate Limit (429) hit. Retrying in {wait_time}s (Attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait_time)
+            else:
+                raise e
+    raise last_err
+
+
 def call_gemini_with_fallback(
     client: genai.Client,
     models_in_priority: List[str],
     contents: str,
     config: types.GenerateContentConfig,
-    max_retries_per_model: int = 2,
 ) -> Any:
-    """Executes a Gemini API call with thread-safe global model blacklisting."""
+    """
+    Instant Failover Execution for Gemini Models.
+    Tries each candidate model once, instantly switching on failure.
+    """
     global EXHAUSTED_MODELS, EXHAUSTED_LOCK
 
-    for model in models_in_priority:
+    last_exception = None
+
+    for raw_model in models_in_priority:
+        model = raw_model.replace("models/", "").strip()
+
         with EXHAUSTED_LOCK:
             if model in EXHAUSTED_MODELS:
                 continue
 
-        delay = 1.0
-        for attempt in range(1, max_retries_per_model + 1):
-            with EXHAUSTED_LOCK:
-                if model in EXHAUSTED_MODELS:
-                    logger.info(
-                        f"Skipping {model} (Attempt {attempt}) - blacklisted by parallel worker."
-                    )
-                    break
+        try:
+            logger.info(f"API Request -> Gemini Model: {model}")
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            return response
 
-            try:
-                logger.info(f"API Request -> Model: {model} (Attempt {attempt})")
-                return client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=config,
-                )
-            except Exception as e:
-                err_msg = str(e)
-                err_code = getattr(e, "code", None)
+        except Exception as e:
+            last_exception = e
+            err_msg = str(e)
+            err_code = getattr(e, "code", None)
 
-                is_quota_exceeded = (
-                    "429" in err_msg
-                    or "RESOURCE_EXHAUSTED" in err_msg
-                    or err_code == 429
-                )
-                is_transient = (
-                    err_code in [500, 502, 503, 504]
-                    or any(code in err_msg for code in ["503", "500", "502", "504"])
-                    or any(
-                        term in err_msg
-                        for term in [
-                            "UNAVAILABLE",
-                            "high demand",
-                            "TEMPORARY",
-                            "overloaded",
-                        ]
-                    )
-                )
+            is_not_found = err_code == 404 or "404" in err_msg or "Not Found" in err_msg
+            if is_not_found:
+                logger.warning(f"Model {model} returned 404. Blacklisting for this run.")
+                with EXHAUSTED_LOCK:
+                    EXHAUSTED_MODELS.add(model)
+            else:
+                logger.warning(f"Gemini Model {model} failed ({err_code or err_msg}). Switching to next Gemini model...")
 
-                if is_quota_exceeded:
-                    logger.warning(
-                        f"Model {model} hit 429 Rate/Quota limit. Blacklisting globally across all threads."
-                    )
-                    with EXHAUSTED_LOCK:
-                        EXHAUSTED_MODELS.add(model)
-                    break
+    raise RuntimeError(f"All Gemini models exhausted. Last error: {last_exception}")
 
-                elif is_transient:
-                    logger.warning(
-                        f"Model {model} hit transient error (Attempt {attempt}/{max_retries_per_model}): {err_msg}"
-                    )
-                    if attempt < max_retries_per_model:
-                        time.sleep(delay)
-                        delay *= 2.0
-                    else:
-                        logger.warning(
-                            f"Exhausted retries for {model}. Blacklisting globally across all threads..."
-                        )
-                        with EXHAUSTED_LOCK:
-                            EXHAUSTED_MODELS.add(model)
-                        break
-                else:
-                    raise e
 
-    with EXHAUSTED_LOCK:
-        blacklisted = list(EXHAUSTED_MODELS)
-    raise RuntimeError(
-        f"All candidate models exhausted or failed: {models_in_priority}. Blacklisted set: {blacklisted}"
-    )
+def call_extraction_with_fallback(
+    client: Optional[genai.Client],
+    models_in_priority: List[str],
+    contents: str,
+    config: types.GenerateContentConfig,
+) -> Any:
+    """
+    PRIMARY: Gemini Models
+    FALLBACK: Groq / OpenRouter (with 429 retry handling)
+    """
+    gemini_error = "Gemini client not initialized."
+
+    if client is not None:
+        try:
+            return call_gemini_with_fallback(client, models_in_priority, contents, config)
+        except Exception as exc:
+            gemini_error = str(exc)
+            logger.warning("Gemini execution failed: %s. Rotating to Groq/OpenRouter fallback...", gemini_error)
+
+    if fallback_keys_available():
+        try:
+            logger.info("API Request -> Provider Fallback (Groq/OpenRouter)")
+            data = generate_json_with_retry(contents, response_schema=config.response_schema)
+            return SimpleNamespace(text=json.dumps(data), parsed=None)
+        except Exception as exc:
+            fallback_error = str(exc)
+            logger.error("Groq/OpenRouter fallback failed: %s", fallback_error)
+            raise RuntimeError(
+                f"Both Gemini and Fallback providers failed. Gemini: {gemini_error} | Fallback: {fallback_error}"
+            )
+
+    raise RuntimeError(f"Gemini failed ({gemini_error}) and no Groq/OpenRouter fallback keys available.")
 
 
 def extract_raw_text_from_file_object(file_obj: Any) -> str:
@@ -179,7 +248,7 @@ def extract_raw_text_from_file_object(file_obj: Any) -> str:
     return "\n\n".join(extracted_pages).strip()
 
 
-def chunk_text(text: str, chunk_size: int = 12000, overlap: int = 1500) -> List[str]:
+def chunk_text(text: str, chunk_size: int = 25000, overlap: int = 1500) -> List[str]:
     if len(text) <= chunk_size:
         return [text]
 
@@ -221,7 +290,7 @@ def map_chunk_worker(
     idx: int,
     total_chunks: int,
     chunk: str,
-    client: genai.Client,
+    client: Optional[genai.Client],
     model_candidates: List[str],
 ) -> Optional[Dict[str, Any]]:
     logger.info(f"Processing chunk {idx}/{total_chunks}...")
@@ -251,7 +320,7 @@ Document Chunk:
     )
 
     try:
-        response = call_gemini_with_fallback(
+        response = call_extraction_with_fallback(
             client=client,
             models_in_priority=model_candidates,
             contents=prompt,
@@ -270,27 +339,32 @@ Document Chunk:
 
 def run_extraction_pipeline(
     files: Any,
-    gemini_key: str,
+    gemini_key: str = "",
     embedder: Optional[Any] = None,
     chroma_client: Optional[Any] = None,
     response_schema: Optional[Type[BaseModel]] = None,
     model_priority: Optional[List[str]] = None,
-    max_parallel_workers: int = 4,
+    max_parallel_workers: int = 5,
+    chunk_size: int = 25000,
+    overlap: int = 1500,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     reset_exhausted_models()
 
-    if not gemini_key:
-        raise ValueError("Missing GEMINI_API_KEY.")
+    if not gemini_key and not fallback_keys_available():
+        raise ValueError("Set GROQ_API_KEY, OPENROUTER_API_KEY, or GEMINI_API_KEY.")
 
     if not model_priority:
+        # Original Gemini model list
         model_priority = [
             "gemini-3.6-flash",
             "gemini-3.5-flash-lite",
             "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash-lite",
         ]
 
-    client = genai.Client(api_key=gemini_key)
+    client = genai.Client(api_key=gemini_key) if gemini_key else None
 
     file_list = files if isinstance(files, list) else [files]
     extracted_texts = []
@@ -303,7 +377,7 @@ def run_extraction_pipeline(
     if not raw_text:
         raise ValueError("Unable to extract text from uploaded document(s).")
 
-    chunks = chunk_text(raw_text, chunk_size=12000, overlap=1500)
+    chunks = chunk_text(raw_text, chunk_size=chunk_size, overlap=overlap)
     logger.info(f"Document chunked into {len(chunks)} segment(s).")
 
     if embedder and chroma_client:
@@ -315,19 +389,31 @@ def run_extraction_pipeline(
         if res:
             intermediate_results[1] = res
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel_workers) as executor:
-            future_to_idx = {
-                executor.submit(
-                    map_chunk_worker, idx, len(chunks), chunk, client, model_priority
-                ): idx
-                for idx, chunk in enumerate(chunks, start=1)
-            }
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel_workers) as executor:
+                future_to_idx = {
+                    executor.submit(
+                        map_chunk_worker, idx, len(chunks), chunk, client, model_priority
+                    ): idx
+                    for idx, chunk in enumerate(chunks, start=1)
+                }
 
-            for future in concurrent.futures.as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                res = future.result()
-                if res:
-                    intermediate_results[idx] = res
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    res = future.result()
+                    if res:
+                        intermediate_results[idx] = res
+        except KeyboardInterrupt:
+            logger.warning("Pipeline execution interrupted by user (Ctrl+C). Stopping workers...")
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+
+    if len(intermediate_results) != len(chunks):
+        missing = [str(i) for i in range(1, len(chunks) + 1) if i not in intermediate_results]
+        raise RuntimeError(
+            "Extraction incomplete. Failed chunks: " + ", ".join(missing)
+            + ". Check provider errors in the log."
+        )
 
     ordered_extractions = [
         intermediate_results[i] for i in sorted(intermediate_results.keys())
@@ -335,10 +421,13 @@ def run_extraction_pipeline(
 
     logger.info("Reduce Phase: Consolidating extractions into final specification schema...")
 
+    # Compact & prune intermediate payload specifically for fallback/Groq context size rules
+    compact_json_str = prune_payload_for_fallback(ordered_extractions)
+
     reduce_prompt = f"""You are a principal software architect. Consolidate these chunk-level extractions into a complete, unified software specification schema in JSON format matching the response schema.
 
 CONSOLIDATION & STRUCTURAL REQUIREMENTS:
-1. "features" MUST be a standard JSON array of feature objects (`[...]`). Do NOT use key-indexed objects (e.g. do not use "0", "1") or array prefixes like `0: {{}}`.
+1. "features" MUST be a standard JSON array of feature objects (`[...]`). Do NOT use key-indexed objects (e.g. do NOT use "0", "1") or array prefixes like `0: {{}}`.
 2. DYNAMIC MODULE CONSOLIDATION (PREVENT OVER-FRAGMENTATION):
    - Do NOT create tiny, granular micro-modules (e.g. avoid separate modules for comments, invitations, password reset, or dashboard).
    - Dynamically aggregate all related capabilities into AT MOST 3 to 5 core macro domain contexts based on shared entity boundaries and relationships (e.g. aggregate identity/accounts/invitations into one identity context; projects/tasks/comments into one work execution context).
@@ -348,7 +437,7 @@ CONSOLIDATION & STRUCTURAL REQUIREMENTS:
 4. Every rule entry under `cross_cutting_constraints` must contain explicit, actionable text extracted from the document. Do NOT output generic placeholder functions or empty signatures.
 
 Chunk Extractions:
-{json.dumps(ordered_extractions, indent=2)}
+{compact_json_str}
 """
 
     reduce_config = types.GenerateContentConfig(
@@ -361,7 +450,7 @@ Chunk Extractions:
     if response_schema:
         reduce_config.response_schema = response_schema
 
-    reduce_response = call_gemini_with_fallback(
+    reduce_response = call_extraction_with_fallback(
         client=client,
         models_in_priority=model_priority,
         contents=reduce_prompt,
@@ -391,7 +480,7 @@ Chunk Extractions:
                 return normalized_data
         return normalized_data
 
-    raise RuntimeError("Failed to obtain valid specification output from Gemini.")
+    raise RuntimeError("Failed to obtain valid specification output from the configured providers.")
 
 
 extract_document_spec = run_extraction_pipeline

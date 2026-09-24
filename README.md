@@ -13,6 +13,23 @@ The current implementation focuses on Phase 1 of the workflow:
 
 ---
 
+## Extraction providers
+
+Phase 1 tries Groq, then OpenRouter, then the existing Gemini fallback list.
+Set `GROQ_API_KEY`, `OPENROUTER_API_KEY`, or `GEMINI_API_KEY` in `.env`;
+providers without keys are skipped. Restart the backend after changing `.env`.
+Groq and OpenRouter receive the uploaded document text when used.
+
+Groq defaults to `openai/gpt-oss-20b`, then `openai/gpt-oss-120b`.
+OpenRouter defaults to `qwen/qwen3.5-35b-a3b`, then `openai/gpt-oss-20b`.
+Optional `GROQ_EXTRACTION_MODEL` and `OPENROUTER_EXTRACTION_MODEL` values replace
+that provider's default model list with a single model. Overrides must support
+JSON output and strict JSON schemas for consolidation.
+
+Groq/OpenRouter calls disable SDK retries and advance on failure. The final
+response is validated against the extraction schema. A failed chunk stops
+consolidation so an incomplete document is not silently returned as a success.
+
 ## What this project does
 
 The application is designed to help transform technical specification documents into machine-readable output such as:
