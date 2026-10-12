@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import shutil
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -27,6 +26,13 @@ def _looks_truncated(code: str) -> bool:
     """Heuristic: unbalanced brackets/quotes mean the model was cut off mid-output."""
     if not code:
         return True
+    # Quotes and brackets inside comments/docstrings are not truncation.
+    import ast
+    try:
+        ast.parse(code)
+        return False
+    except SyntaxError:
+        pass
     pairs = {")": "(", "]": "[", "}": "{"}
     stack = []
     in_str = None
@@ -147,7 +153,13 @@ class CoderAgent:
         )
 
         # Gemini client (Fallback Tier)
-        self.gemini_client = genai.Client(api_key=gemini_api_key)
+        self.gemini_client = genai.Client(
+            api_key=gemini_api_key,
+            http_options=types.HttpOptions(
+                timeout=60_000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
 
         # Optional OpenRouter client retained for future use
         self.openrouter_client = (
@@ -303,7 +315,14 @@ class CoderAgent:
                     ),
                 )
             except Exception as exc:
-                if cap == GEMINI_MAX_OUTPUT_TOKENS:
+                # Only a token-budget rejection can be fixed by lowering the cap.
+                # Retrying auth, quota, or unavailable-model errors here amplifies
+                # the outer provider fallback loop without changing the request.
+                error_text = str(exc).lower()
+                budget_error = any(marker in error_text for marker in (
+                    "max_output_tokens", "maxoutputtokens", "token limit", "token budget",
+                ))
+                if cap == GEMINI_MAX_OUTPUT_TOKENS and budget_error:
                     logger.warning(
                         f"Gemini '{model_name}' rejected a {cap}-token budget ({exc}). "
                         f"Retrying with 8192."
@@ -335,10 +354,7 @@ class CoderAgent:
 
         return None
 
-    def _process_single_feature(self, feature: dict, index: int = 0, revision_notes: str = "") -> dict:
-        if index > 0:
-            time.sleep(index * 1.5)
-
+    def _process_single_feature(self, feature: dict, index: int = 0, revision_notes: str = "", current_code: str = "") -> dict:
         module_name = feature.get("target_module", "unnamed_module")
         logger.info(f"Coder Agent: Synthesizing module '{module_name}'...")
 
@@ -348,6 +364,12 @@ class CoderAgent:
                 "\nHUMAN REVISION REQUEST (highest priority - the code MUST honour this):\n"
                 f"{revision_notes}\n"
             )
+            if current_code:
+                revision_block += (
+                    "\nCURRENT DRAFT TO REVISE (preserve previous changes and unrelated behavior):\n"
+                    f"{current_code}\n"
+                    "Return the complete updated file after applying the revision request.\n"
+                )
 
         base_prompt = f"""
 Target Module: {module_name}
@@ -497,16 +519,16 @@ Instructions:
             "test_output": test_output,
         }
 
-    def generate_single_module(self, feature: dict, revision_notes: str = "") -> dict:
+    def generate_single_module(self, feature: dict, revision_notes: str = "", current_code: str = "") -> dict:
         """Synthesizes ONE module through the full MCP-validated pipeline.
 
         Exposed so the LangGraph agent gets the exact same quality gates as the
         bulk Coder Agent run (prompt engineering, AST syntax guardrail, staged
         pytest), instead of a raw single-shot LLM call.
         """
-        return self._process_single_feature(feature, index=0, revision_notes=revision_notes)
+        return self._process_single_feature(feature, index=0, revision_notes=revision_notes, current_code=current_code)
 
-    def generate_drafts_from_specs(self, specs_data: dict, revision_notes: str = "") -> list:
+    def generate_drafts_from_specs(self, specs_data: dict, revision_notes: str = "", current_codes: Optional[dict] = None) -> list:
         hitl_queue.clear()
         features = specs_data.get("features", [])
         if not features:
@@ -519,7 +541,8 @@ Instructions:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future_to_feature = {
                 executor.submit(
-                    self._process_single_feature, feature, idx, revision_notes
+                    self._process_single_feature, feature, idx, revision_notes,
+                    (current_codes or {}).get(feature["target_module"], ""),
                 ): feature
                 for idx, feature in enumerate(features)
             }

@@ -8,7 +8,8 @@ from backend.models.schemas import (
     StartExecutionRequest,
     HumanFeedbackRequest
 )
-from backend.agent.graph import agent_app
+from backend.agent.graph import agent_app, _is_approval
+from backend.workspace import clear_generated_workspace
 
 # Fallback imports to support different working directory executions
 try:
@@ -29,6 +30,18 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/phase2", tags=["Phase 2 Agent & Coder"])
+
+
+def _reset_generated_workspace():
+    try:
+        clear_generated_workspace()
+    except (OSError, ValueError) as exc:
+        logger.error("Could not clear generated_src for a new run: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Could not clear generated_src. Release any locked files and retry; generation has not started.",
+        ) from exc
+    hitl_queue.clear()
 
 
 # ==========================================
@@ -55,15 +68,7 @@ async def generate_drafts(specs: ProjectSpecs):
 
     logger.info("Starting Phase 2 Coder Agent draft generation...")
 
-    try:
-        from main import clear_generated_workspace
-        clear_generated_workspace("generated_src")
-    except ImportError:
-        try:
-            from backend.main import clear_generated_workspace
-            clear_generated_workspace("generated_src")
-        except Exception as err:
-            logger.warning(f"Could not clear workspace automatically: {err}")
+    _reset_generated_workspace()
 
     drafts = CoderAgent(
         groq_api_key=groq_key or "",
@@ -102,14 +107,20 @@ async def approve_and_commit(payload: HITLApprovalPayload):
 # ==========================================
 
 def _draft_summaries(values: dict) -> list:
-    """Lightweight per-module view returned to the UI for the approval cards."""
+    """Return separate files, including code, for the module review cards."""
     return [
         {
             "draft_id": draft.get("draft_id"),
             "target_module": draft.get("target_module"),
+            "file_path": draft["target_module"].replace(".", "/") + ".py",
+            "feature_name": draft.get("feature_name"),
+            "code": draft.get("code", ""),
             "validation_msg": draft.get("validation_msg"),
             "syntax_valid": draft.get("syntax_valid"),
             "tests_passed": draft.get("tests_passed"),
+            "test_output": draft.get("test_output", ""),
+            "status": draft.get("status", "AWAITING_HUMAN_REVIEW"),
+            "commit_error": draft.get("commit_error"),
         }
         for draft in (values.get("drafts") or [])
     ]
@@ -118,6 +129,11 @@ def _draft_summaries(values: dict) -> list:
 @router.post("/start")
 async def start_agent_workflow(req: StartExecutionRequest):
     config = {"configurable": {"thread_id": req.thread_id}}
+    if agent_app.get_state(config).values:
+        raise HTTPException(status_code=409, detail="This thread already started. Create a new thread for a new run.")
+    if not req.task_spec.strip():
+        raise HTTPException(status_code=400, detail="Task specification must not be empty.")
+    _reset_generated_workspace()
     initial_state = {
         "task_spec": req.task_spec,
         "messages": [],
@@ -139,15 +155,59 @@ async def start_agent_workflow(req: StartExecutionRequest):
     }
 
 
+@router.get("/state/{thread_id}")
+async def get_agent_state(thread_id: str):
+    """Refresh review files without resuming generation or approving them."""
+    state = agent_app.get_state({"configurable": {"thread_id": thread_id}})
+    if not state.values:
+        raise HTTPException(status_code=404, detail="Agent thread not found. Start a new thread if the backend restarted.")
+    return {
+        "thread_id": thread_id,
+        "is_completed": not state.next,
+        "status": state.values.get("status"),
+        "latest_output": state.values.get("generated_plan_or_code"),
+        "modules": _draft_summaries(state.values),
+    }
+
+
 @router.post("/feedback")
 async def submit_human_feedback(req: HumanFeedbackRequest):
     config = {"configurable": {"thread_id": req.thread_id}}
+    state = agent_app.get_state(config)
+    if not state.values:
+        raise HTTPException(status_code=404, detail="Agent thread not found.")
+    if state.next != ("process_feedback",):
+        raise HTTPException(status_code=409, detail="This thread is not waiting for feedback.")
+    if req.target_module is not None:
+        targets = {f["target_module"] for f in state.values["base_specs"]["features"]}
+        if req.target_module not in targets:
+            raise HTTPException(status_code=400, detail="Unknown target module.")
+        if req.modified_spec is not None:
+            raise HTTPException(status_code=400, detail="Use project feedback to change the specification.")
+    if _is_approval(req.user_feedback):
+        if req.target_module is None:
+            raise HTTPException(status_code=400, detail="Approve files individually using each file's approval button.")
+        draft = next((d for d in state.values.get("drafts") or [] if d["target_module"] == req.target_module), None)
+        if not draft or not draft.get("syntax_valid") or not (draft.get("code") or "").strip():
+            raise HTTPException(status_code=400, detail="Generate a valid draft for this file before approval.")
+        if draft.get("status") == "COMMITTED":
+            raise HTTPException(status_code=409, detail="This file is already approved and saved.")
+
+    # An empty submission must leave the existing interrupt untouched.
+    if not req.user_feedback.strip() and not req.modified_spec:
+        return {
+            "thread_id": req.thread_id, "is_completed": False,
+            "status": state.values.get("status"),
+            "latest_output": state.values.get("generated_plan_or_code"),
+            "modules": _draft_summaries(state.values),
+        }
 
     agent_app.update_state(
         config,
         {
-            "user_feedback": req.user_feedback,
-            "modified_spec": req.modified_spec
+            "user_feedback": req.user_feedback.strip() or "Implement the updated specification.",
+            "modified_spec": req.modified_spec,
+            "revision_target": req.target_module,
         },
         as_node="generate_code"
     )
