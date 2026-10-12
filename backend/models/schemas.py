@@ -107,6 +107,10 @@ class StartExecutionRequest(BaseModel):
 class HumanFeedbackRequest(BaseModel):
     thread_id: str = Field(..., description="Unique thread identifier for state persistence.")
     user_feedback: str = Field(..., description="Human review input or revision feedback.")
+    target_module: Optional[str] = Field(
+        default=None,
+        description="Module to revise or approve. Required for approval; omit for project-wide revisions.",
+    )
     modified_spec: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional modified spec object passed back from the UI.",

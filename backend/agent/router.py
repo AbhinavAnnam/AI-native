@@ -65,7 +65,6 @@ class _RetryingChatModel:
 
     def invoke(self, messages, **kwargs):
         last_err: Exception = None
-        delay = 1.0
         for model in self.candidates:
             for attempt in range(2):
                 try:
@@ -73,6 +72,8 @@ class _RetryingChatModel:
                         model=model,
                         google_api_key=self.api_key,
                         temperature=self.temperature,
+                        timeout=60,
+                        max_retries=0,
                     )
                     return llm.invoke(messages)
                 except Exception as exc:
@@ -81,9 +82,8 @@ class _RetryingChatModel:
                         f"[LLMRouter] code model '{model}' failed "
                         f"(attempt {attempt + 1}/2): {exc}"
                     )
-                    if _is_transient(exc):
-                        time.sleep(delay)
-                        delay *= 2.0
+                    if _is_transient(exc) and attempt == 0:
+                        time.sleep(1.0)
                         continue
                     break
         raise last_err
@@ -95,7 +95,6 @@ class LLMRouter:
 
     def _run_with_fallback(self, candidates, temperature, prompt, response_schema=None):
         last_err: Exception = None
-        delay = 1.0
         for model in candidates:
             for attempt in range(2):
                 try:
@@ -103,6 +102,8 @@ class LLMRouter:
                         model=model,
                         google_api_key=self.api_key,
                         temperature=temperature,
+                        timeout=30,
+                        max_retries=0,
                     )
                     if response_schema is not None:
                         llm = llm.with_structured_output(response_schema)
@@ -113,9 +114,8 @@ class LLMRouter:
                         f"[LLMRouter] classifier '{model}' failed "
                         f"(attempt {attempt + 1}/2): {exc}"
                     )
-                    if _is_transient(exc):
-                        time.sleep(delay)
-                        delay *= 2.0
+                    if _is_transient(exc) and attempt == 0:
+                        time.sleep(1.0)
                         continue
                     break
         raise last_err

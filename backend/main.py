@@ -39,18 +39,6 @@ def configure_logging():
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def clear_generated_workspace(base_dir: str = "generated_src") -> str:
-    """Deletes and recreates the generated source workspace directory."""
-    import shutil
-
-    abs_dir = os.path.abspath(base_dir)
-    if os.path.exists(abs_dir):
-        shutil.rmtree(abs_dir, ignore_errors=True)
-    os.makedirs(abs_dir, exist_ok=True)
-    logger.info(f"Cleared and recreated generated workspace at {abs_dir}")
-    return abs_dir
-
-
 configure_logging()
 
 app = FastAPI(title="AI-Native Core API")
