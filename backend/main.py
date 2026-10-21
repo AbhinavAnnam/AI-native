@@ -1,6 +1,8 @@
 import os
 import sys
 import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
 from dotenv import load_dotenv
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,10 +16,14 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from deps import LOG_FILE
 from routers.phase1_router import router as phase1_router
-from routers.phase2_router import router as phase2_router
+from backend.routers import phase2_router
+from backend.routers.critic_router import router as critic_router
+from backend.routers.delivery_router import router as delivery_router
+from backend.agent.graph import build_agent_graph
 from routers.logs_router import router as logs_router
 
 logger = logging.getLogger(__name__)
@@ -41,7 +47,22 @@ def configure_logging():
 
 configure_logging()
 
-app = FastAPI(title="AI-Native Core API")
+CHECKPOINT_DB = Path(ROOT_DIR) / "workspace" / "checkpoints.sqlite"
+
+
+@asynccontextmanager
+async def lifespan(app):
+    CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+    previous_graph = phase2_router.agent_app
+    with SqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as checkpointer:
+        phase2_router.agent_app = build_agent_graph(checkpointer=checkpointer)
+        try:
+            yield
+        finally:
+            phase2_router.agent_app = previous_graph
+
+
+app = FastAPI(title="AI-Native Core API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,9 +73,11 @@ app.add_middleware(
 )
 
 app.include_router(phase1_router)
-app.include_router(phase2_router)
+app.include_router(phase2_router.router)
+app.include_router(critic_router)
+app.include_router(delivery_router)
 app.include_router(logs_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000)

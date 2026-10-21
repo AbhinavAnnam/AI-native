@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from backend.models.repository import RepositoryRequest
 
 
 # ==========================================
@@ -7,6 +8,7 @@ from pydantic import BaseModel, Field
 # ==========================================
 
 class FunctionSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     signature: str = Field(
         description="Full function signature including parameters, type annotations, and return type."
     )
@@ -14,6 +16,7 @@ class FunctionSpec(BaseModel):
 
 
 class FeatureSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     feature_name: str = Field(description="Human-readable feature module name.")
     target_module: str = Field(
         description="Dynamically generated snake_case module identifier (e.g., iam_identity, organization_management, work_management)."
@@ -30,6 +33,7 @@ class FeatureSpec(BaseModel):
 
 
 class ConstraintCategory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     category_name: str = Field(
         description="Snake_case constraint category identifier."
     )
@@ -39,6 +43,7 @@ class ConstraintCategory(BaseModel):
 
 
 class ProjectSpecs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     project_title: str = Field(
         description="Title or system name extracted dynamically from the specification document."
     )
@@ -102,6 +107,9 @@ class TaskClassification(BaseModel):
 class StartExecutionRequest(BaseModel):
     thread_id: str = Field(..., description="Unique thread identifier for state persistence.")
     task_spec: str = Field(..., description="Task or module specification prompt to execute.")
+    repository: Optional[RepositoryRequest] = Field(
+        default=None, description="Optional existing repository and explicit module-to-file mappings.",
+    )
 
 
 class HumanFeedbackRequest(BaseModel):
@@ -111,6 +119,7 @@ class HumanFeedbackRequest(BaseModel):
         default=None,
         description="Module to revise or approve. Required for approval; omit for project-wide revisions.",
     )
+    input_fingerprint: Optional[str] = Field(default=None, description="Expected critic review fingerprint for approval.")
     modified_spec: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional modified spec object passed back from the UI.",

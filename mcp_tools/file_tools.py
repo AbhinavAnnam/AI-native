@@ -82,6 +82,7 @@ class MCPToolServer:
             )
             return {
                 "success": result.returncode == 0,
+                "returncode": result.returncode,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
             }
