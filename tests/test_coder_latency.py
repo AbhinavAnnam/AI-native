@@ -77,3 +77,63 @@ def test_revision_prompt_includes_current_code_and_feedback(monkeypatch, tmp_pat
     prompt = generate.call_args.args[0]
     assert "Change value to 42" in prompt
     assert "VALUE = 1\n# Keep the previous changes" in prompt
+
+
+def test_repository_generation_receives_original_code_without_revision_notes(monkeypatch, tmp_path):
+    agent = object.__new__(CoderAgent)
+    agent.staging_dir = tmp_path / "staging"
+    generate = Mock(return_value="VALUE = 42")
+    agent._generate_with_fallback = generate
+    runner = Mock(side_effect=AssertionError("Repository execution belongs to the tester stage"))
+    monkeypatch.setattr(coder.MCPToolServer, "run_pytest_suite", runner)
+    result = agent.generate_drafts_from_specs(
+        {"features": [{"target_module": "accounts", "business_rules": ["Use value 42"]}]},
+        current_codes={"accounts": "VALUE = 1\n# Preserve this interface"},
+        repository_context="src/organization_demo/organizations.py\nExisting tests and interfaces",
+    )
+    prompt = generate.call_args.args[0]
+    assert "VALUE = 1\n# Preserve this interface" in prompt
+    assert "src/organization_demo/organizations.py" in prompt
+    assert "Existing tests and interfaces" in prompt
+    assert not result[0]["tests_passed"]
+    assert "not run" in result[0]["test_output"].lower()
+    runner.assert_not_called()
+
+
+def test_no_tests_collected_is_unverified_and_does_not_trigger_code_repair(monkeypatch, tmp_path):
+    agent = object.__new__(CoderAgent)
+    agent.staging_dir = tmp_path / "staging"
+    agent._generate_with_fallback = Mock(return_value="VALUE = 1")
+    monkeypatch.setattr(coder.MCPToolServer, "write_module_to_disk", Mock())
+    monkeypatch.setattr(coder.MCPToolServer, "run_pytest_suite", Mock(return_value={
+        "success": False, "returncode": 5, "stdout": "collected 0 items", "stderr": "",
+    }))
+    result = agent.generate_single_module({"target_module": "accounts"})
+    assert not result["tests_passed"]
+    assert result["syntax_valid"]
+    assert agent._generate_with_fallback.call_count == 1
+
+
+def test_provider_failure_preserves_successful_modules_without_error_code(monkeypatch, tmp_path):
+    from phase2_coder.providers import DraftGenerationError
+    agent = object.__new__(CoderAgent)
+    agent.staging_dir = tmp_path / "staging"
+    agent._generate_with_fallback = Mock(side_effect=["VALUE = 1", DraftGenerationError("Cooldown")])
+    runner = Mock(side_effect=AssertionError("No repository execution"))
+    monkeypatch.setattr(coder.MCPToolServer, "run_pytest_suite", runner)
+    drafts = agent.generate_drafts_from_specs({"features": [
+        {"target_module": "accounts"}, {"target_module": "projects"}]}, repository_context="Existing repository")
+    assert [d["target_module"] for d in drafts] == ["accounts"]
+    assert agent.failed_modules == {"projects"}
+    assert agent._generate_with_fallback.call_count == 2
+
+
+def test_coder_delegates_drafts_to_bounded_router_with_all_existing_keys(monkeypatch):
+    from phase2_coder import providers
+    agent = object.__new__(CoderAgent)
+    agent._repair_keys = {"groq": "one", "gemini": "two", "openrouter": "three"}
+    request = Mock(return_value="VALUE = 1\n")
+    monkeypatch.setattr(providers, "generate_draft_text", request)
+    assert agent._generate_with_fallback("Complete requirements") == "VALUE = 1\n"
+    assert request.call_args.args[0] == "Complete requirements"
+    assert request.call_args.kwargs["keys"] == agent._repair_keys

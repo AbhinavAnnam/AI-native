@@ -45,22 +45,21 @@ def fake_client(monkeypatch, side_effect):
     return factory, client.chat.completions.create
 
 
-def test_groq_schema_response_does_not_call_gemini(monkeypatch):
+def test_groq_schema_response_when_gemini_is_not_configured(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "offline-key")
     factory, create = fake_client(monkeypatch, [response(SPEC)])
-    gemini = SimpleNamespace(models=SimpleNamespace(generate_content=Mock()))
+    original_schema = ProjectSpecs.model_json_schema()
     result = extractor.call_extraction_with_fallback(
-        gemini, ["gemini"], "Extract JSON", types.GenerateContentConfig(response_schema=ProjectSpecs),
+        None, [], "Extract JSON", types.GenerateContentConfig(response_schema=ProjectSpecs),
     )
     assert json.loads(result.text) == SPEC
-    gemini.models.generate_content.assert_not_called()
     assert factory.call_args.kwargs["max_retries"] == 0
     request = create.call_args.kwargs
     assert request["model"] == "openai/gpt-oss-20b"
     schema = request["response_format"]["json_schema"]["schema"]
     assert schema["additionalProperties"] is False
     assert schema["$defs"]["FeatureSpec"]["additionalProperties"] is False
-    assert "additionalProperties" not in ProjectSpecs.model_json_schema()
+    assert ProjectSpecs.model_json_schema() == original_schema
 
 
 @pytest.mark.parametrize("bad_response", [response({}, "length"), response({"wrong": "schema"})])
@@ -115,24 +114,24 @@ def test_gemini_404_still_skips_missing_model():
     assert [call.kwargs["model"] for call in generate.call_args_list] == ["missing", "working", "working"]
 
 
-def test_full_map_reduce_works_without_gemini(monkeypatch):
+def test_structured_extraction_and_local_merge_work_without_gemini(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "offline-groq")
-    _, create = fake_client(monkeypatch, [response({"accounts": "unique emails"}), response(SPEC)])
+    _, create = fake_client(monkeypatch, [response(SPEC)])
     monkeypatch.setattr(extractor, "extract_raw_text_from_file_object", lambda file: "Accounts require unique emails.")
     assert extractor.run_extraction_pipeline(b"document", response_schema=ProjectSpecs) == SPEC
-    assert create.call_count == 2
-    assert create.call_args_list[0].kwargs["response_format"] == {"type": "json_object"}
-    assert create.call_args_list[1].kwargs["response_format"]["type"] == "json_schema"
+    assert create.call_count == 1
+    assert create.call_args.kwargs["response_format"]["type"] == "json_schema"
 
 
 def test_failed_chunk_cannot_produce_partial_success(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "offline-groq")
     monkeypatch.setattr(extractor, "extract_raw_text_from_file_object", lambda file: "x" * 50000)
-    generate = Mock(side_effect=[RuntimeError("unavailable"), {"accounts": "unique emails"}])
+    # 50,000 characters with 25,000-sized chunks and 1,500 overlap produces THREE chunks.
+    generate = Mock(side_effect=[RuntimeError("unavailable"), SPEC, SPEC])
     monkeypatch.setattr(extractor, "generate_json", generate)
     with pytest.raises(RuntimeError, match="Failed chunks: 1"):
-        extractor.run_extraction_pipeline(b"document", response_schema=ProjectSpecs)
-    assert generate.call_count == 2
+        extractor.run_extraction_pipeline(b"document", response_schema=ProjectSpecs, max_parallel_workers=1)
+    assert generate.call_count == 3
 
 
 def test_all_provider_failures_report_failure(monkeypatch):

@@ -9,3 +9,4 @@ temp_uploads/
 chroma_db_docs/
 pipeline.log
 extracted_specs.json
+tests/
