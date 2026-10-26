@@ -20,7 +20,13 @@ Repository contracts live in `backend/models/repository.py`. Concrete Git operat
 
 ## Documentation and PR boundary
 
-Phase 4 combines the user interface while keeping two service operations: `generate_documentation` and `publish_pull_request`. `backend/models/delivery.py` defines strict Pydantic request/result contracts; `backend/routers/delivery_router.py` supplies locking, SQLite persistence and HTTP errors. A future MCP adapter can call these operations without Streamlit or FastAPI. No MCP server or tester phase is added.
+Phase 4 combines the user interface while keeping two service operations: `generate_documentation` and `publish_pull_request`. `backend/models/delivery.py` defines strict Pydantic request/result contracts; `backend/routers/delivery_router.py` supplies locking, SQLite persistence and HTTP errors. The optional MCP adapter calls these existing HTTP routes; no tester phase is added.
+
+## MCP adapter
+
+`mcp_tools/server.py` exposes typed tools through the official SDK's stdio transport. `mcp_tools/api_client.py` forwards to the running local backend, preserving its graph instance, SQLite connection, workflow locks, model budgets, review/approval guards, and publishing behavior. The adapter never imports `backend.main` or starts another graph. Input models reuse the backend's request contracts. Structured successes wrap the existing JSON response under `data`; safe tool errors preserve HTTP status, retry hints, and uncertainty after connection failures. Actions are never automatically replayed.
+
+PDF access is restricted to an operator-selected local directory and bounded uploads. Backend URLs are local loopback only; credentials remain in the backend. Approval and publication require explicit caller confirmation, while backend fingerprints and prerequisites remain authoritative. Clients must retain human approval controls; confirmation flags are not authentication. Optional SDK dependencies are installed separately so the working API/UI environment stays unchanged. See [MCP setup](mcp.md).
 
 Project approval reuses the existing per-file save guards under one workflow lock, refreshing the report fingerprint after each expected write. Completed saves remain checkpointed if a subsequent write fails. This is resumable approval, not an atomic multi-file filesystem transaction. Missing/invalid drafts, stale review and pending repair block approval/delivery.
 

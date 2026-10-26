@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ai-native": {
+      "command": "C:/Users/abhin/AI-Native/workspace/mcp-venv/Scripts/python.exe",
+      "args": [
+        "C:/Users/abhin/AI-Native/mcp_tools/server.py",
+        "--backend-url", "http://127.0.0.1:8000",
+        "--documents-root", "C:/Users/abhin/AI-Native/docs"
+      ]
+    }
+  }
+}

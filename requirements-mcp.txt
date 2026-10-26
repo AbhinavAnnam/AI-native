@@ -1,0 +1,4 @@
+# Optional adapter dependencies. Install in its own environment; backend stays unchanged.
+mcp==1.30.0
+# Compatible with the application's existing FastAPI/Starlette environment.
+sse-starlette>=2.1,<3

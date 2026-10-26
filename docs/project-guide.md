@@ -241,7 +241,7 @@ The non-repository coder still contains a legacy staging/pytest validation path.
 | Documentation | Local analysis/rendering in `backend/stages/documentation.py`; no model |
 | PR creation | Git/GitHub operations; no model |
 
-At the time of this guide, ordinary draft candidates are Groq's configured models, Gemini Flash Lite, then Nemotron Ultra through OpenRouter, followed by other eligible free OpenRouter routes. Request size, available keys, catalog checks, cooldowns, and attempt budgets can skip candidates. Critic and repair have their own routing policies. Configured model IDs are candidates, not a guarantee of current provider availability or account quota; inspect these files and logs for the actual route used.
+Ordinary draft candidates are Groq's configured models, Gemini Flash Lite, then Qwen3.8 27B, Qwen3 Coder, and Nemotron Ultra through OpenRouter, followed by other eligible free OpenRouter routes. The two Qwen free routes were added on 22 October 2026. Request size, available keys, catalog checks, cooldowns, and the unchanged attempt/time budgets can skip candidates. Critic and repair have their own routing policies. Configured model IDs are candidates, not a guarantee of current provider availability or account quota; inspect these files and logs for the actual route used.
 
 ## 9. File map: reusable stages and external tools
 
@@ -317,18 +317,18 @@ Structured output means data has an expected shape and is validated before use. 
 
 Structured output makes parsing and workflow control more reliable. It does not make a model's judgments automatically correct or remove rate limits.
 
-## 12. MCP: what exists and what is still to add
+## 12. MCP: the additional entry point
 
-Today, Streamlit calls FastAPI, which calls the services. A future MCP adapter would expose selected operations to another compatible AI application:
+Streamlit and the optional local MCP adapter both call the same FastAPI backend:
 
 ```text
-Current: Streamlit UI -> FastAPI routers -> services
-Future:  External AI -> MCP server/tools -> those same services
+Streamlit UI -> FastAPI routers -> services
+External AI -> local MCP server/tools -> the same FastAPI routers -> services
 ```
 
-Likely tools include extract requirements, generate code, inspect run state, review, repair, approve, generate documentation, and create a draft PR. Usually one MCP server can expose multiple tools. Backend prerequisites, checkpoints, freshness checks, and explicit publication approval still apply.
+The server exposes extraction, code generation/revision, status, missing-module retry, critic review, repair, approval, documentation, and draft PR tools. Backend prerequisites, checkpoints, freshness checks, model budgets, and explicit publication approval still apply. It does not run a second workflow engine.
 
-The separation into `models/`, `stages/`, `tools/`, and `routers/` makes that adapter easier to add. It does not mean every phase is already a protocol-ready standalone service. Skills are optional instructions for agents on when/how to use tools; they are distinct from MCP tools.
+`mcp_tools/server.py` registers the tools and provides stdio transport. `mcp_tools/api_client.py` forwards requests and confines PDF reads to an operator-selected directory. `mcp_tools/client.example.json` shows a client configuration; `requirements-mcp.txt` contains optional dependencies; `mcp_tools/tests/test_server.py` verifies protocol and shared-state behavior. See [MCP setup and tool examples](mcp.md). The existing `MCPToolServer` in `file_tools.py` remains a local helper, distinct from this actual MCP server. Skills are optional agent instructions and remain separate from tools.
 
 ## 13. Where to start reading or debugging
 
