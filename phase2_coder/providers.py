@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 DEEPSEEK_FREE = "deepseek/deepseek-v4-flash:free"
 FREE_CODER = "cohere/north-mini-code:free"
 NEMOTRON_FREE = "nvidia/nemotron-3-ultra-550b-a55b:free"
+QWEN_FREE = "qwen/qwen3.8-27b:free"
+QWEN_CODER_FREE = "qwen/qwen3-coder:free"
 _cooldowns, _quotas, _availability = {}, {}, {}
 _state_lock = Lock()
 
@@ -88,14 +90,15 @@ def _candidates(keys):
     if keys.get("gemini"):
         yield "Gemini", "gemini-3.5-flash-lite", keys["gemini"]
     if keys.get("openrouter"):
-        yield "OpenRouter", NEMOTRON_FREE, keys["openrouter"]
+        for model in (QWEN_FREE, QWEN_CODER_FREE, NEMOTRON_FREE):
+            yield "OpenRouter", model, keys["openrouter"]
     if keys.get("openrouter"):
         override = os.getenv("CODER_OPENROUTER_MODEL", "")
         if override and not _free_model(override):
             logger.warning("Ignoring paid CODER_OPENROUTER_MODEL; only free draft routes are allowed")
             override = ""
         for model in dict.fromkeys(filter(None, [override, DEEPSEEK_FREE, FREE_CODER, "openrouter/free"])):
-            if model != NEMOTRON_FREE:
+            if model not in {QWEN_FREE, QWEN_CODER_FREE, NEMOTRON_FREE}:
                 yield "OpenRouter", model, keys["openrouter"]
 
 

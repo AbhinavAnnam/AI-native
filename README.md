@@ -14,6 +14,8 @@ This repository is a development prototype. Model-generated requirements and sou
 ## Contents
 
 - [Plain-language workflow and file guide](docs/project-guide.md)
+- [MCP tools and client setup](docs/mcp.md)
+- [Portable AI-Native orchestration skill](skills/ai-native-engineering/SKILL.md)
 - [Architecture](#architecture)
 - [Project structure](#project-structure)
 - [How the workflows work](#how-the-workflows-work)
@@ -25,6 +27,8 @@ This repository is a development prototype. Model-generated requirements and sou
 - [Limitations and troubleshooting](#limitations-and-troubleshooting)
 
 ## Architecture
+
+The optional [MCP adapter](docs/mcp.md) exposes extraction, coding, critic/repair, documentation, and draft PR creation to local MCP clients. It calls the existing FastAPI endpoints and shares their saved runs and safeguards. Streamlit continues using the same backend. Adapter dependencies are separate in `requirements-mcp.txt`.
 
 ```text
                  +---------------------------+
@@ -126,7 +130,7 @@ The default Groq extraction candidates are `openai/gpt-oss-20b` and `openai/gpt-
 
 Use Agent Studio to generate and revise persisted drafts. Phase 2 displays separate files and accepts per-file or project feedback. Approval now lives in **Phase 3: Critic & Repair**. Draft and repair generation do not write unapproved code into the repository clone or `generated_src/`.
 
-Draft routing lives in `phase2_coder/providers.py`: Groq `openai/gpt-oss-20b`, Groq `openai/gpt-oss-120b`, Gemini `gemini-3.5-flash-lite`, then OpenRouter `nvidia/nemotron-3-ultra-550b-a55b:free`. Additional free OpenRouter routes (`deepseek/deepseek-v4-flash:free`, `cohere/north-mini-code:free`, `openrouter/free`, or a free override) follow if budget remains. Skipped candidates do not spend inference attempts. The coder no longer enumerates every active Groq model or walks a long Gemini model list. Critic repair retains its separate existing routing.
+Draft routing lives in `phase2_coder/providers.py`: Groq `openai/gpt-oss-20b`, Groq `openai/gpt-oss-120b`, Gemini `gemini-3.5-flash-lite`, then OpenRouter `qwen/qwen3.8-27b:free`, `qwen/qwen3-coder:free`, and `nvidia/nemotron-3-ultra-550b-a55b:free`. Additional free OpenRouter routes (`deepseek/deepseek-v4-flash:free`, `cohere/north-mini-code:free`, `openrouter/free`, or a free override) follow if budget remains. Each explicit OpenRouter route must have a verified active zero-priced endpoint. The existing four-attempt and 120-second module defaults still apply; adding candidates does not guarantee every route is attempted. Skipped candidates do not spend inference attempts. The coder no longer enumerates every active Groq model or walks a long Gemini model list. Critic repair retains its separate existing routing.
 
 Quota cooldowns are process-local and scoped to the provider, model and API key. They expire automatically: models can be used again without a backend restart. When multiple provider families are configured, quota waits yield immediately to the next fallback. Single-provider setups retain up to ten seconds of short quota waits per module. Daily quota retry hints are honored without waiting minutes inside the request. Timed-out models cool down for three minutes to avoid repeating a slow request on every following file; other temporary network/server failures cool down for 30 seconds and invalid/unavailable endpoints for five minutes. Free OpenRouter endpoint availability and zero token pricing are rechecked after 60 seconds. Only `:free` IDs or `openrouter/free` are accepted for OpenRouter draft overrides; a paid extraction-model setting cannot change this policy. Free-provider availability and account quotas still apply.
 
@@ -199,7 +203,7 @@ Reports contain stable requirement IDs for business rules, functions, exceptions
 
 A full input fingerprint covers candidate source, specification, mappings, baseline source, relevant supplied disk context, and review-budget settings. Identical inputs reuse the checkpointed report without inference. Revisions or disk/context changes make it outdated; repair and approval recheck the fingerprint. Expected writes during per-file approval refresh the fingerprint without spending tokens on another review. Repository overwrite protection still applies after a new review.
 
-The core operations are `backend.stages.critic.review_candidate(snapshot, cached, reviewer)` and `repair_candidate(state, snapshot, report, repairer)`. Contracts are in `backend/models/critic.py`; HTTP orchestration is in `backend/routers/critic_router.py`. There is no MCP implementation in this change; a future adapter can call these transport-independent operations.
+The core operations are `backend.stages.critic.review_candidate(snapshot, cached, reviewer)` and `repair_candidate(state, snapshot, report, repairer)`. Contracts are in `backend/models/critic.py`; HTTP orchestration is in `backend/routers/critic_router.py`. The optional MCP adapter exposes these actions through their existing HTTP endpoints; see [MCP setup](docs/mcp.md).
 
 ### Critic API
 
