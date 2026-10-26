@@ -1,12 +1,12 @@
 # AI-Native Requirements Extraction and Code Generation
 
-AI-Native is a Python prototype for moving from software requirements documents to structured specifications and reviewed Python module drafts. A FastAPI service exposes the workflows, and a Streamlit application provides a control center for document upload, specification review, code generation, human approval, and execution logs.
+AI-Native is a Python prototype for moving from software requirements documents to structured specifications, reviewed Python code, change documentation, and GitHub draft pull requests. A FastAPI backend executes the workflows. Users can work through Streamlit, or connect an AI application through the optional MCP tools and orchestration skill.
 
 The project currently has four connected phases:
 
 - **Phase 1 — Requirements extraction:** upload one or more text-based PDF documents. The backend extracts their text, divides it into manageable chunks, asks configured language-model providers to extract requirements, consolidates the chunk results, validates the final object, and returns structured JSON.
-- **Phase 2 ? Code generation:** generate persisted drafts and request per-file or project revisions through LangGraph.
-- **Phase 3 ? Critic and repair:** compare drafts with requirements, inspect findings, request targeted repairs, and approve accepted files into the local repository clone or `generated_src/`.
+- **Phase 2 — Code generation:** generate persisted drafts and request per-file or project revisions through LangGraph.
+- **Phase 3 — Critic and repair:** compare drafts with requirements, inspect findings, request targeted repairs, and approve accepted files into the local repository clone or `generated_src/`.
 - **Phase 4 — Documentation and pull request:** preview a Markdown report of accepted changes, coverage and remaining findings, then explicitly create a GitHub draft PR. The tester phase is skipped.
 
 This repository is a development prototype. Model-generated requirements and source code should be reviewed before being used in a production system.
@@ -28,56 +28,67 @@ This repository is a development prototype. Model-generated requirements and sou
 
 ## Architecture
 
-The optional [MCP adapter](docs/mcp.md) exposes extraction, coding, critic/repair, documentation, and draft PR creation to local MCP clients. It calls the existing FastAPI endpoints and shares their saved runs and safeguards. Streamlit continues using the same backend. Adapter dependencies are separate in `requirements-mcp.txt`.
+There are two ways to access the same backend:
 
-```text
-                 +---------------------------+
-                 |  Streamlit control center |
-                 |  frontend/app.py          |
-                 +-------------+-------------+
-                               | HTTP
-                               v
-                 +---------------------------+
-                 | FastAPI application       |
-                 | backend/main.py           |
-                 +------+--------------------+
-                        |
-            +-----------+------------+
-            |                        |
-            v                        v
-  +---------------------+  +-----------------------+
-  | Phase 1 extraction  |  | Phase 2 code drafting|
-  | PDF text, chunking, |  | CoderAgent, review,  |
-  | provider fallback,  |  | approval, file tools |
-  | schema validation   |  +-----------------------+
-  +---------------------+             ^
-                                       |
-                          +------------+-----------+
-                          | LangGraph Agent Studio |
-                          | classify, draft, revise|
-                          +------------------------+
+- **Streamlit:** the existing interface for uploading PDFs, reviewing drafts, requesting repairs, accepting code, and publishing a draft PR.
+- **MCP tools:** one local stdio server exposes **10 tools** covering the phases, revisions, approval, and saved-run recovery. A compatible AI application launches the server and calls the existing FastAPI endpoints. Optional dependencies and client configuration are described in [MCP setup](docs/mcp.md).
+
+The [portable orchestration skill](skills/ai-native-engineering/SKILL.md) gives a connected AI agent instructions for choosing and sequencing those tools. Load it in the client separately; the file does not execute a workflow by itself. It preserves separate user approvals for saving accepted code and publishing a PR. Keep the skill and its reference examples in Git.
+
+```mermaid
+flowchart TD
+    UI[Streamlit control center] --> API[FastAPI backend]
+    Skill[Portable orchestration skill] -. guides .-> Agent[Connected AI agent]
+    Agent --> MCP[Local MCP server: 10 tools]
+    MCP --> API
+    API --> P1[Phase 1: PDF to structured requirements]
+    API --> P2[Phase 2: LangGraph code drafting and revisions]
+    API --> P3[Phase 3: Critic, repair, and code acceptance]
+    API --> P4[Phase 4: Documentation and draft PR]
+    P1 -. requirements .-> P2
+    P2 -. candidate code .-> P3
+    P3 -. accepted code and report .-> P4
+    API --> State[SQLite checkpoints and local workspaces]
+    P4 --> GitHub[GitHub draft PR after publication approval]
 ```
 
-The FastAPI routes are divided by workflow. Phase 1 is implemented in `backend/routers/phase1_router.py`, Phase 2 routes are in `backend/routers/phase2_router.py`, and log retrieval is in `backend/routers/logs_router.py`. Request and response models for the main payloads are defined in `backend/models/schemas.py`.
+Phase routes live in `backend/routers/`; reusable stage operations live in `backend/stages/`; typed request and result contracts live in `backend/models/`. LangGraph coordinates coding and revisions, while the critic and delivery routes coordinate their own operations. Both interfaces share the same checkpoints, model routing, limits, and approval checks. For the detailed workflow and file responsibilities, see the [project guide](docs/project-guide.md).
 
 ## Project structure
 
 ```text
 AI-Native/
 ├── backend/
-│   ├── main.py                    # FastAPI app, logging, CORS, and router setup
+│   ├── main.py                    # FastAPI app, routers, and SQLite checkpoint lifecycle
 │   ├── deps.py                    # Shared Sentence Transformers and ChromaDB clients
+│   ├── workspace.py               # Generated-output directory lifecycle
 │   ├── models/
-│   │   └── schemas.py             # Phase 1 and Phase 2 Pydantic models
+│   │   ├── schemas.py             # Requirements, drafts, and feedback contracts
+│   │   ├── repository.py          # Repository request and workspace contracts
+│   │   ├── critic.py              # Coverage, findings, review, and repair contracts
+│   │   └── delivery.py            # Documentation and PR contracts
 │   ├── routers/
-│   │   ├── phase1_router.py       # POST /api/phase1/extract
-│   │   ├── phase2_router.py       # Code draft and agent routes
-│   │   └── logs_router.py         # GET /api/logs
+│   │   ├── phase1_router.py       # PDF extraction API
+│   │   ├── phase2_router.py       # Code generation, revision, and saved-run API
+│   │   ├── critic_router.py       # Review, repair, and code acceptance API
+│   │   ├── delivery_router.py     # Documentation preview and draft PR API
+│   │   └── logs_router.py         # Execution log API
+│   ├── stages/
+│   │   ├── planning.py            # Specification-to-module planning
+│   │   ├── repository.py          # Repository preparation and target-file selection
+│   │   ├── review_planning.py     # Critic requirement inventory and batch planning
+│   │   ├── critic.py              # Candidate review and coverage assessment
+│   │   ├── repair.py              # Targeted repairs and candidate handling
+│   │   ├── documentation.py       # Deterministic Markdown change report
+│   │   └── pull_request.py        # Accepted-change publication workflow
+│   ├── tools/
+│   │   ├── git_provider.py        # Local Git operations
+│   │   └── github_provider.py     # GitHub API operations
 │   └── agent/
-│       ├── graph.py               # LangGraph generation and review loop
-│       └── router.py              # Gemini model selection and retries
+│       ├── graph.py               # LangGraph drafting, revision, and save nodes
+│       └── router.py              # Agent model selection and fallback helpers
 ├── frontend/
-│   └── app.py                     # Streamlit control center
+│   └── app.py                     # Four-phase Streamlit control center
 ├── phase1_rag/
 │   ├── extractor.py               # PDF text extraction, typed chunk inference
 │   ├── consolidation.py           # Lossless local merge and requirement checks
@@ -86,16 +97,29 @@ AI-Native/
 │   ├── parser.py                  # Directory parser for PDF/DOCX/Markdown/text
 │   └── embedder.py                # Persistent ChromaDB document embedder utility
 ├── phase2_coder/
-│   ├── coder.py                   # Module drafting and provider fallbacks
-│   └── hitl_manager.py            # In-memory human review queue
+│   ├── coder.py                   # Module drafting, repair prompts, and syntax checks
+│   ├── providers.py               # Draft model routing, budgets, and cooldowns
+│   └── hitl_manager.py            # Legacy in-memory human review queue
 ├── mcp_tools/
-│   └── file_tools.py              # Python syntax validation and module file tools
-├── docs/                          # Example/source documents
+│   ├── server.py                  # Local stdio MCP server and 10 tool definitions
+│   ├── api_client.py              # Backend forwarding and PDF access checks
+│   ├── client.example.json        # Example MCP client configuration
+│   ├── file_tools.py              # Internal syntax validation and module file helpers
+│   └── tests/test_server.py       # MCP adapter verification
+├── skills/ai-native-engineering/
+│   ├── SKILL.md                   # Portable instructions for a connected AI agent
+│   └── references/tool-inputs.md  # Input examples for all 10 MCP tools
+├── docs/                          # Project guide, architecture, MCP setup, source PDFs
+├── workspace/                     # Local checkpoints, clones, and optional MCP environment
+├── generated_src/                 # Accepted source for non-repository runs
 ├── artifacts/                     # Saved review artifacts, if present
-├── requirements.txt
+├── requirements.txt               # Application dependencies
+├── requirements-mcp.txt           # Optional MCP adapter dependencies
 ├── run_phase1.py                  # Earlier standalone workflow, not the API entry point
 └── README.md
 ```
+
+This tree highlights the main components. `workspace/` and `.env` are local and ignored by Git; API keys belong in `.env`. Pending drafts and workflow state are stored in `workspace/checkpoints.sqlite`. Repository runs save accepted code under `workspace/<run_id>/repo/`; non-repository runs use `generated_src/`. Saving code locally and committing/pushing a draft PR are separate actions.
 
 ## How the workflows work
 
